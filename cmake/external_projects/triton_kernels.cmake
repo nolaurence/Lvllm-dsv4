@@ -25,7 +25,11 @@ else()
 endif()
 
 # Fetch content
+string(TIMESTAMP _ts "%Y-%m-%d %H:%M:%S")
+message(STATUS "[${_ts}] >>> FetchContent: downloading triton_kernels ...")
 FetchContent_MakeAvailable(triton_kernels)
+string(TIMESTAMP _ts "%Y-%m-%d %H:%M:%S")
+message(STATUS "[${_ts}] <<< FetchContent: triton_kernels download complete")
 
 if (NOT triton_kernels_SOURCE_DIR)
   message (FATAL_ERROR "[triton_kernels] Cannot resolve triton_kernels_SOURCE_DIR")

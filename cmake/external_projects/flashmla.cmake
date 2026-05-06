@@ -27,7 +27,11 @@ else()
 endif()
 
 
+string(TIMESTAMP _ts "%Y-%m-%d %H:%M:%S")
+message(STATUS "[${_ts}] >>> FetchContent: downloading FlashMLA ...")
 FetchContent_MakeAvailable(flashmla)
+string(TIMESTAMP _ts "%Y-%m-%d %H:%M:%S")
+message(STATUS "[${_ts}] <<< FetchContent: FlashMLA download complete")
 message(STATUS "FlashMLA is available at ${flashmla_SOURCE_DIR}")
 
 # Vendor FlashMLA interface into vLLM with torch-ops shim.

@@ -300,7 +300,11 @@ else()
       GIT_SHALLOW FALSE
   )
 endif()
+string(TIMESTAMP _ts "%Y-%m-%d %H:%M:%S")
+message(STATUS "[${_ts}] >>> FetchContent: downloading llama_cpp (llama.cpp) ...")
 FetchContent_MakeAvailable(llama_cpp)
+string(TIMESTAMP _ts "%Y-%m-%d %H:%M:%S")
+message(STATUS "[${_ts}] <<< FetchContent: llama_cpp download complete")
 
 #
 # cumem_allocator extension
@@ -410,7 +414,11 @@ if(VLLM_GPU_LANG STREQUAL "CUDA")
         GIT_SHALLOW TRUE
     )
   endif()
+  string(TIMESTAMP _ts "%Y-%m-%d %H:%M:%S")
+  message(STATUS "[${_ts}] >>> FetchContent: downloading cutlass ...")
   FetchContent_MakeAvailable(cutlass)
+  string(TIMESTAMP _ts "%Y-%m-%d %H:%M:%S")
+  message(STATUS "[${_ts}] <<< FetchContent: cutlass download complete")
 
   list(APPEND VLLM_EXT_SRC
     "csrc/quantization/awq/gemm_kernels.cu"

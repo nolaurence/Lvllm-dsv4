@@ -54,7 +54,11 @@ install(CODE "set(OLD_CMAKE_INSTALL_PREFIX \"\${CMAKE_INSTALL_PREFIX}\")" ALL_CO
 install(CODE "set(CMAKE_INSTALL_PREFIX \"\${CMAKE_INSTALL_PREFIX}/vllm/\")" ALL_COMPONENTS)
 
 # Fetch the vllm-flash-attn library
+string(TIMESTAMP _ts "%Y-%m-%d %H:%M:%S")
+message(STATUS "[${_ts}] >>> FetchContent: downloading vllm-flash-attn ...")
 FetchContent_MakeAvailable(vllm-flash-attn)
+string(TIMESTAMP _ts "%Y-%m-%d %H:%M:%S")
+message(STATUS "[${_ts}] <<< FetchContent: vllm-flash-attn download complete")
 message(STATUS "vllm-flash-attn is available at ${vllm-flash-attn_SOURCE_DIR}")
 
 # Restore the install prefix after FA's install rules

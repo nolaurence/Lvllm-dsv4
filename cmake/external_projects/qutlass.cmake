@@ -24,7 +24,11 @@ else()
   )
 endif()
 
+string(TIMESTAMP _ts "%Y-%m-%d %H:%M:%S")
+message(STATUS "[${_ts}] >>> FetchContent: downloading qutlass ...")
 FetchContent_Populate(qutlass)
+string(TIMESTAMP _ts "%Y-%m-%d %H:%M:%S")
+message(STATUS "[${_ts}] <<< FetchContent: qutlass download complete")
 
 if(NOT qutlass_SOURCE_DIR)
   message(FATAL_ERROR "[QUTLASS] source directory could not be resolved.")

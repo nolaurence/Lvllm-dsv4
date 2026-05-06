@@ -32,7 +32,11 @@ endif()
 # DeepGEMM's own CMakeLists.txt which has incompatible find_package calls.
 FetchContent_GetProperties(deepgemm)
 if(NOT deepgemm_POPULATED)
+  string(TIMESTAMP _ts "%Y-%m-%d %H:%M:%S")
+  message(STATUS "[${_ts}] >>> FetchContent: downloading DeepGEMM ...")
   FetchContent_Populate(deepgemm)
+  string(TIMESTAMP _ts "%Y-%m-%d %H:%M:%S")
+  message(STATUS "[${_ts}] <<< FetchContent: DeepGEMM download complete")
 endif()
 message(STATUS "DeepGEMM is available at ${deepgemm_SOURCE_DIR}")
 
