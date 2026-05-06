@@ -80,7 +80,6 @@ def test_ignore_torch_compile_decorator(use_inductor_graph_partition, monkeypatc
     vllm_config = VllmConfig(
         compilation_config=CompilationConfig(
             mode=CompilationMode.VLLM_COMPILE,
-            use_cudagraph=True,
             splitting_ops=["silly::attention"],
             cudagraph_capture_sizes=[1, 2],
             use_inductor_graph_partition=use_inductor_graph_partition,
@@ -215,7 +214,6 @@ def test_conditional_compile_enable_if(use_inductor_graph_partition, monkeypatch
         ),
         compilation_config=CompilationConfig(
             mode=CompilationMode.VLLM_COMPILE,
-            use_cudagraph=True,
             splitting_ops=["silly::attention"],
             cudagraph_capture_sizes=[1, 2],
             use_inductor_graph_partition=use_inductor_graph_partition,
@@ -236,7 +234,7 @@ def test_conditional_compile_enable_if(use_inductor_graph_partition, monkeypatch
         expected_num_backend_compilations = 4
 
     # A has support_torch_compile but enable_if fn returns False
-    # enalbe_if will be True for B, so we expect mod1 and mod2
+    # enable_if will be True for B, so we expect mod1 and mod2
     # to be compiled
     with compilation_counter.expect(
         num_graphs_seen=2,
@@ -257,7 +255,6 @@ def test_conditional_compile_enable_if(use_inductor_graph_partition, monkeypatch
         ),
         compilation_config=CompilationConfig(
             mode=CompilationMode.VLLM_COMPILE,
-            use_cudagraph=True,
             splitting_ops=["silly::attention"],
             cudagraph_capture_sizes=[1, 2],
             use_inductor_graph_partition=use_inductor_graph_partition,

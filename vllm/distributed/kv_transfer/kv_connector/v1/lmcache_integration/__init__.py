@@ -2,6 +2,19 @@
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 
 
-from . import vllm_v1_adapter
+from . import multi_process_adapter, vllm_v1_adapter
+from .multi_process_adapter import (
+    LMCacheMPSchedulerAdapter,
+    LMCacheMPWorkerAdapter,
+    LoadStoreOp,
+    ParallelStrategy,
+)
 
-__all__ = ["vllm_v1_adapter"]
+__all__ = [
+    "vllm_v1_adapter",
+    "multi_process_adapter",
+    "LMCacheMPSchedulerAdapter",
+    "LMCacheMPWorkerAdapter",
+    "LoadStoreOp",
+    "ParallelStrategy",
+]

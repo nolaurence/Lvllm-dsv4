@@ -5,8 +5,6 @@ import torch
 from einops import rearrange
 from torch import nn
 
-from vllm.attention import AttentionBackend
-from vllm.attention.backends.abstract import AttentionMetadata
 from vllm.config import CacheConfig, ModelConfig, get_current_vllm_config
 from vllm.distributed import (
     divide,
@@ -32,7 +30,11 @@ from .linear import (
     RowParallelLinear,
 )
 from .mamba.abstract import MambaBase
-from .mamba.mamba_utils import MambaStateDtypeCalculator, MambaStateShapeCalculator
+from .mamba.mamba_utils import (
+    MambaStateDtypeCalculator,
+    MambaStateShapeCalculator,
+    is_conv_state_dim_first,
+)
 from .mamba.ops.causal_conv1d import causal_conv1d_fn, causal_conv1d_update
 from .quantization.base_config import QuantizationConfig
 
@@ -40,18 +42,33 @@ logger = init_logger(__name__)
 
 
 def kda_attention(
-    hidden_states: torch.Tensor,
-    output: torch.Tensor,
+    q_proj_states: torch.Tensor,
+    k_proj_states: torch.Tensor,
+    v_proj_states: torch.Tensor,
+    g1: torch.Tensor,
+    beta: torch.Tensor,
+    core_attn_out: torch.Tensor,
     layer_name: str,
 ) -> None:
     forward_context: ForwardContext = get_forward_context()
     self = forward_context.no_compile_layers[layer_name]
-    self._forward(hidden_states=hidden_states, output=output)
+    self._forward(
+        q_proj_states=q_proj_states,
+        k_proj_states=k_proj_states,
+        v_proj_states=v_proj_states,
+        g1=g1,
+        beta=beta,
+        core_attn_out=core_attn_out,
+    )
 
 
 def kda_attention_fake(
-    hidden_states: torch.Tensor,
-    output: torch.Tensor,
+    q_proj_states: torch.Tensor,
+    k_proj_states: torch.Tensor,
+    v_proj_states: torch.Tensor,
+    g1: torch.Tensor,
+    beta: torch.Tensor,
+    core_attn_out: torch.Tensor,
     layer_name: str,
 ) -> None:
     return
@@ -60,7 +77,7 @@ def kda_attention_fake(
 direct_register_custom_op(
     op_name="kda_attention",
     op_func=kda_attention,
-    mutates_args=["output"],
+    mutates_args=["core_attn_out"],
     fake_impl=kda_attention_fake,
 )
 
@@ -68,12 +85,7 @@ direct_register_custom_op(
 class KimiDeltaAttention(nn.Module, MambaBase):
     @property
     def mamba_type(self) -> str:
-        return "linear_attention"
-
-    def get_attn_backend(self) -> type["AttentionBackend"]:
-        from vllm.v1.attention.backends.gdn_attn import GDNAttentionBackend
-
-        return GDNAttentionBackend
+        return "gdn_attention"
 
     def get_state_dtype(
         self,
@@ -110,7 +122,7 @@ class KimiDeltaAttention(nn.Module, MambaBase):
         self.cache_config = cache_config
         if model_config is None:
             raise ValueError("model_config must be provided")
-        kda_config = model_config.linear_attn_config
+        kda_config = model_config.linear_attn_config  # type: ignore[attr-defined]
         self.head_dim = kda_config["head_dim"]
         self.num_heads = kda_config["num_heads"]
         self.layer_idx = layer_idx
@@ -242,55 +254,78 @@ class KimiDeltaAttention(nn.Module, MambaBase):
         positions: torch.Tensor,
         output: torch.Tensor,
     ) -> None:
-        return torch.ops.vllm.kda_attention(
-            hidden_states,
-            output,
+        num_tokens = hidden_states.size(0)
+        q = self.q_proj(hidden_states)[0]
+        k = self.k_proj(hidden_states)[0]
+        v = self.v_proj(hidden_states)[0]
+
+        beta = self.b_proj(hidden_states)[0].float().sigmoid()
+        g1 = self.f_b_proj(self.f_a_proj(hidden_states)[0])[0]
+        g1 = fused_kda_gate(g1, self.A_log, self.head_dim, g_bias=self.dt_bias)
+        beta = beta.unsqueeze(0)
+        g1 = g1.unsqueeze(0)
+
+        g_proj_states = self.g_b_proj(self.g_a_proj(hidden_states)[0])[0]
+        g2 = rearrange(g_proj_states, "... (h d) -> ... h d", d=self.head_dim)
+
+        core_attn_out = torch.zeros(
+            (1, num_tokens, self.local_num_heads, self.head_dim),
+            dtype=hidden_states.dtype,
+            device=hidden_states.device,
+        )
+        torch.ops.vllm.kda_attention(
+            q,
+            k,
+            v,
+            g1,
+            beta,
+            core_attn_out,
             self.prefix,
         )
+        core_attn_out = self.o_norm(core_attn_out, g2)
+        core_attn_out = rearrange(core_attn_out, "1 n h d -> n (h d)")
+        output[:] = self.o_proj(core_attn_out)[0]
 
     def _forward(
         self,
-        hidden_states: torch.Tensor,
-        output: torch.Tensor,
+        q_proj_states: torch.Tensor,
+        k_proj_states: torch.Tensor,
+        v_proj_states: torch.Tensor,
+        g1: torch.Tensor,
+        beta: torch.Tensor,
+        core_attn_out: torch.Tensor,
     ) -> None:
         forward_context = get_forward_context()
-        attn_metadata: AttentionMetadata = forward_context.attn_metadata
+        attn_metadata_raw = forward_context.attn_metadata
 
-        if attn_metadata is None:
-            # V1 profile run
-            # Mimic the memory allocation in the real run
-            q = torch.empty_like(hidden_states)
-            k = torch.empty_like(hidden_states)
-            v = torch.empty_like(hidden_states)
-            g = hidden_states.new_empty(
-                hidden_states.size(0),
-                self.local_num_heads,
-                self.head_dim,
-                dtype=torch.float32,
-            )
-            beta = torch.empty(
-                hidden_states.size(0), self.local_num_heads, dtype=torch.float32
-            )
-            core_attn_out = torch.empty_like(hidden_states)
+        if attn_metadata_raw is None:
+            #     # V1 profile run
             return
 
-        assert isinstance(attn_metadata, dict)
-        attn_metadata = attn_metadata[self.prefix]
-        assert isinstance(attn_metadata, GDNAttentionMetadata)
-        has_initial_state = attn_metadata.has_initial_state
-        non_spec_query_start_loc = attn_metadata.non_spec_query_start_loc
-        non_spec_state_indices_tensor = attn_metadata.non_spec_state_indices_tensor  # noqa: E501
-        constant_caches = self.kv_cache[forward_context.virtual_engine]
+        assert isinstance(attn_metadata_raw, dict)
+        attn_metadata_narrowed = attn_metadata_raw[self.prefix]
+        assert isinstance(attn_metadata_narrowed, GDNAttentionMetadata)
+        has_initial_state = attn_metadata_narrowed.has_initial_state
+        non_spec_query_start_loc = attn_metadata_narrowed.non_spec_query_start_loc
+        non_spec_state_indices_tensor = (
+            attn_metadata_narrowed.non_spec_state_indices_tensor
+        )  # noqa: E501
+        num_actual_tokens = attn_metadata_narrowed.num_actual_tokens
+        constant_caches = self.kv_cache
+
+        q_proj_states = q_proj_states[:num_actual_tokens]
+        k_proj_states = k_proj_states[:num_actual_tokens]
+        v_proj_states = v_proj_states[:num_actual_tokens]
+        g1 = g1[:num_actual_tokens]
+        beta = beta[:num_actual_tokens]
 
         (conv_state_q, conv_state_k, conv_state_v, recurrent_state) = constant_caches
-        # deal with strides
-        conv_state_q = conv_state_q.transpose(-1, -2)
-        conv_state_k = conv_state_k.transpose(-1, -2)
-        conv_state_v = conv_state_v.transpose(-1, -2)
-
-        q_proj_states = self.q_proj(hidden_states)[0]
-        k_proj_states = self.k_proj(hidden_states)[0]
-        v_proj_states = self.v_proj(hidden_states)[0]
+        # conv_state must be (..., dim, width-1) for the conv kernels.
+        # DS layout stores it that way directly; SD layout needs a transpose.
+        if not is_conv_state_dim_first():
+            conv_state_q = conv_state_q.transpose(-1, -2)
+            conv_state_k = conv_state_k.transpose(-1, -2)
+            conv_state_v = conv_state_v.transpose(-1, -2)
 
         q_conv_weights = self.q_conv1d.weight.view(
             self.q_conv1d.weight.size(0), self.q_conv1d.weight.size(2)
@@ -301,7 +336,7 @@ class KimiDeltaAttention(nn.Module, MambaBase):
         v_conv_weights = self.v_conv1d.weight.view(
             self.v_conv1d.weight.size(0), self.v_conv1d.weight.size(2)
         )
-        if attn_metadata.num_prefills > 0:
+        if attn_metadata_narrowed.num_prefills > 0:
             q_proj_states = q_proj_states.transpose(0, 1)
             k_proj_states = k_proj_states.transpose(0, 1)
             v_proj_states = v_proj_states.transpose(0, 1)
@@ -314,7 +349,7 @@ class KimiDeltaAttention(nn.Module, MambaBase):
                 has_initial_state=has_initial_state,
                 cache_indices=non_spec_state_indices_tensor,
                 query_start_loc=non_spec_query_start_loc,
-                metadata=attn_metadata,
+                metadata=attn_metadata_narrowed,
             ).transpose(0, 1)
             k = causal_conv1d_fn(
                 k_proj_states,
@@ -325,7 +360,7 @@ class KimiDeltaAttention(nn.Module, MambaBase):
                 has_initial_state=has_initial_state,
                 cache_indices=non_spec_state_indices_tensor,
                 query_start_loc=non_spec_query_start_loc,
-                metadata=attn_metadata,
+                metadata=attn_metadata_narrowed,
             ).transpose(0, 1)
             v = causal_conv1d_fn(
                 v_proj_states,
@@ -336,11 +371,12 @@ class KimiDeltaAttention(nn.Module, MambaBase):
                 has_initial_state=has_initial_state,
                 cache_indices=non_spec_state_indices_tensor,
                 query_start_loc=non_spec_query_start_loc,
-                metadata=attn_metadata,
+                metadata=attn_metadata_narrowed,
             ).transpose(0, 1)
         else:
+            assert non_spec_state_indices_tensor is not None
             decode_conv_indices = non_spec_state_indices_tensor[
-                : attn_metadata.num_decodes
+                : attn_metadata_narrowed.num_actual_tokens
             ]
             q = causal_conv1d_update(
                 q_proj_states,
@@ -374,15 +410,9 @@ class KimiDeltaAttention(nn.Module, MambaBase):
             lambda x: rearrange(x, "n (h d) -> 1 n h d", d=self.head_dim), (q, k, v)
         )
 
-        beta = self.b_proj(hidden_states)[0].float().sigmoid()
-
-        g = self.f_b_proj(self.f_a_proj(hidden_states)[0])[0]
-        g = fused_kda_gate(g, self.A_log, self.head_dim, g_bias=self.dt_bias)
-
-        beta = beta.unsqueeze(0)
-        g = g.unsqueeze(0)
-
-        if attn_metadata.num_prefills > 0:
+        if attn_metadata_narrowed.num_prefills > 0:
+            assert non_spec_state_indices_tensor is not None
+            assert has_initial_state is not None
             zero_idx = non_spec_state_indices_tensor[~has_initial_state]
             recurrent_state[zero_idx] = 0
             initial_state = recurrent_state[non_spec_state_indices_tensor].contiguous()
@@ -393,7 +423,7 @@ class KimiDeltaAttention(nn.Module, MambaBase):
                 q=q,
                 k=k,
                 v=v,
-                g=g,
+                g=g1,
                 beta=beta,
                 initial_state=initial_state,
                 output_final_state=True,
@@ -403,6 +433,7 @@ class KimiDeltaAttention(nn.Module, MambaBase):
             # Init cache
             recurrent_state[non_spec_state_indices_tensor] = last_recurrent_state
         else:
+            assert non_spec_query_start_loc is not None
             (
                 core_attn_out_non_spec,
                 last_recurrent_state,
@@ -410,17 +441,15 @@ class KimiDeltaAttention(nn.Module, MambaBase):
                 q=q,
                 k=k,
                 v=v,
-                g=g,
+                g=g1,
                 beta=beta,
                 initial_state=recurrent_state,
                 use_qk_l2norm_in_kernel=True,
-                cu_seqlens=non_spec_query_start_loc,
+                cu_seqlens=non_spec_query_start_loc[
+                    : attn_metadata_narrowed.num_decodes + 1
+                ],
                 ssm_state_indices=non_spec_state_indices_tensor,
             )
-
-        g_proj_states = self.g_b_proj(self.g_a_proj(hidden_states)[0])[0]
-        g = rearrange(g_proj_states, "... (h d) -> ... h d", d=self.head_dim)
-        core_attn_out = self.o_norm(core_attn_out_non_spec, g)
-        core_attn_out = rearrange(core_attn_out, "1 n h d -> n (h d)")
-
-        output[:] = self.o_proj(core_attn_out)[0]
+        core_attn_out[0, :num_actual_tokens] = core_attn_out_non_spec[
+            0, :num_actual_tokens
+        ]
