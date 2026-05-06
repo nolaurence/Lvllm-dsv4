@@ -11,7 +11,7 @@ requires = [
     "wheel",
     "jinja2",
 ]
-build-backend = "setuptools.build_meta"-- FetchContent base directory: /home/nolaurence/dev/lvllm/Lvllm-2510/.deps
+build-backend = "setuptools.build_meta"
 
 [project]
 name = "vllm"

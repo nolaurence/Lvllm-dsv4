@@ -301,7 +301,7 @@ __launch_bounds__(WARPS_PER_CTA* WARP_SIZE_PARAM) __global__
     asm volatile("griddepcontrol.launch_dependents;");
 #endif
     return;
-  }
+  } else {
 
 #pragma unroll
   for (int ii = 0; ii < VPT; ++ii) {
@@ -425,6 +425,7 @@ __launch_bounds__(WARPS_PER_CTA* WARP_SIZE_PARAM) __global__
 #if (defined(__CUDA_ARCH__) && (__CUDA_ARCH__ >= 900))
   asm volatile("griddepcontrol.launch_dependents;");
 #endif
+  }
 }
 
 namespace detail {
