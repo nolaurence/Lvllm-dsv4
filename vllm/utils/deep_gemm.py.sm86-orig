@@ -106,16 +106,14 @@ def is_deep_gemm_e8m0_used() -> bool:
     _lazy_init()
 
     if _fp8_gemm_nt_impl is None:
-        logger.info_once(
-            "DeepGEMM E8M0 disabled: _fp8_gemm_nt_impl not found", scope="local"
-        )
+        logger.info_once("DeepGEMM E8M0 disabled: _fp8_gemm_nt_impl not found")
         return False
 
     if envs.VLLM_USE_DEEP_GEMM_E8M0:
-        logger.info_once("DeepGEMM E8M0 enabled on current platform.", scope="local")
+        logger.info_once("DeepGEMM E8M0 enabled on current platform.")
         return True
 
-    logger.info_once("DeepGEMM E8M0 disabled on current configuration.", scope="local")
+    logger.info_once("DeepGEMM E8M0 disabled on current configuration.")
     return False
 
 
@@ -125,25 +123,6 @@ def _missing(*_: Any, **__: Any) -> NoReturn:
         "DeepGEMM backend is not available or outdated. Please install or "
         "update the `deep_gemm` to a newer version to enable FP8 kernels."
     )
-
-
-@functools.cache
-def _use_sm86_reference() -> bool:
-    """Force pure-PyTorch reference paths in lieu of DeepGEMM kernels.
-
-    Auto-enabled on SM<90 (Ampere/Ada) where DeepGEMM kernels hard-assert
-    on architecture. Can be forced on/off via VLLM_SM86_DEEPSEEK_V4_REF.
-    """
-    forced = os.environ.get("VLLM_SM86_DEEPSEEK_V4_REF", "").strip()
-    if forced in ("0", "false", "False"):
-        return False
-    if forced in ("1", "true", "True"):
-        return True
-    try:
-        cap = torch.cuda.get_device_capability(0)
-        return cap < (9, 0)
-    except Exception:
-        return False
 
 
 _cublaslt_gemm_nt_impl: Callable[..., Any] | None = None
@@ -316,106 +295,7 @@ def fp8_gemm_nt(*args, **kwargs):
     return _fp8_gemm_nt_impl(*args, disable_ue8m0_cast=not use_ue8m0, **kwargs)
 
 
-def _fp8_einsum_pyref(equation, a_pair, b_pair, out, recipe=None):
-    """SM86 reference for DeepGEMM fp8_einsum.
-
-    Generic FP8/FP4 block-scaled einsum with operand reshape inference:
-      • Dequant in each operand's native (possibly flat) layout.
-      • Parse equation, derive subscript sizes from out + matching operands.
-      • If an operand has fewer dims than its subscripts, infer a
-        contiguous split that matches known sizes, then reshape.
-      • Run einsum in BF16 (Ampere tensor cores).
-    """
-    from itertools import combinations
-
-    a, a_scale = a_pair
-    b, b_scale = b_pair
-
-    e8m0 = getattr(torch, "float8_e8m0fnu", None)
-
-    def _expand_scale(t, s):
-        if e8m0 is not None and s.dtype == e8m0:
-            s = s.to(torch.float32)
-        s = s.to(torch.float32).contiguous()
-        while s.dim() < t.dim():
-            s = s.unsqueeze(0)
-        for d in range(t.dim()):
-            if s.shape[d] < t.shape[d]:
-                tile = (t.shape[d] + s.shape[d] - 1) // s.shape[d]
-                s = s.repeat_interleave(tile, dim=d)
-            if s.shape[d] > t.shape[d]:
-                s = s.narrow(d, 0, t.shape[d])
-        return s
-
-    def _ensure_shape(operand, subs, sizes):
-        if operand.dim() == len(subs):
-            for s, sz in zip(subs, operand.shape):
-                sizes.setdefault(s, sz)
-            return operand
-        if operand.dim() > len(subs):
-            raise ValueError(
-                f"operand has {operand.dim()} dims, equation subscripts {subs} expect {len(subs)}"
-            )
-        n_dims, n_subs = operand.dim(), len(subs)
-        for splits in combinations(range(1, n_subs), n_dims - 1):
-            bounds = [0, *splits, n_subs]
-            groups = [subs[bounds[i] : bounds[i + 1]] for i in range(n_dims)]
-            trial_sizes = dict(sizes)
-            target = []
-            ok = True
-            for op_dim, grp in zip(operand.shape, groups):
-                known_prod = 1
-                unknowns = []
-                for s in grp:
-                    if s in trial_sizes:
-                        known_prod *= trial_sizes[s]
-                    else:
-                        unknowns.append(s)
-                if len(unknowns) > 1:
-                    ok = False
-                    break
-                if op_dim % known_prod != 0:
-                    ok = False
-                    break
-                if unknowns:
-                    trial_sizes[unknowns[0]] = op_dim // known_prod
-                elif known_prod != op_dim:
-                    ok = False
-                    break
-                target.extend(trial_sizes[s] for s in grp)
-            if ok and len(target) == n_subs:
-                sizes.update(trial_sizes)
-                return operand.reshape(target)
-        raise ValueError(
-            f"cannot reshape operand {operand.shape} to match subscripts {subs} (known sizes: {sizes})"
-        )
-
-    inputs_str, output_str = equation.split("->")
-    a_subs, b_subs = [s.strip() for s in inputs_str.split(",")]
-    out_subs = output_str.strip()
-
-    sizes: dict[str, int] = {}
-    for s, sz in zip(out_subs, out.shape):
-        sizes[s] = sz
-
-    a_deq_flat = (a.to(torch.float32) * _expand_scale(a, a_scale)).to(torch.bfloat16)
-    b_deq_flat = (b.to(torch.float32) * _expand_scale(b, b_scale)).to(torch.bfloat16)
-
-    a_deq = _ensure_shape(a_deq_flat, a_subs, sizes)
-    b_deq = _ensure_shape(b_deq_flat, b_subs, sizes)
-
-    result = torch.einsum(equation, a_deq, b_deq).to(out.dtype)
-    out.copy_(result)
-
-
 def fp8_einsum(*args, **kwargs):
-    if _use_sm86_reference():
-        equation = args[0] if len(args) >= 1 else kwargs.get("equation")
-        a_pair = args[1] if len(args) >= 2 else kwargs.get("a")
-        b_pair = args[2] if len(args) >= 3 else kwargs.get("b")
-        out = args[3] if len(args) >= 4 else kwargs.get("out")
-        recipe = kwargs.get("recipe")
-        return _fp8_einsum_pyref(equation, a_pair, b_pair, out, recipe)
     _lazy_init()
     if _fp8_einsum_impl is None:
         return _missing(*args, **kwargs)
@@ -458,39 +338,6 @@ def transform_sf_into_required_layout(*args, **kwargs):
     )
 
 
-def _fp8_mqa_logits_pyref(
-    q_values: torch.Tensor,
-    k_packed: torch.Tensor,
-    k_scales: torch.Tensor,
-    weights: torch.Tensor,
-    cu_seqlen_ks: torch.Tensor,
-    cu_seqlen_ke: torch.Tensor,
-    clean_logits: bool,
-) -> torch.Tensor:
-    """SM86 FP8 reference for fp8_fp4_mqa_logits (FP8 q, FP8 k path only).
-
-    q_values: [M, H, D] float8_e4m3fn
-    k_packed: [N, D]    float8_e4m3fn
-    k_scales: [N]       float32
-    weights:  [M, H]    float32
-    """
-    M, H, D = q_values.shape
-    N = k_packed.shape[0]
-    # Tensor-core matmul in BF16 (Ampere). FP8→BF16 cast is exact (FP8 has
-    # 4-bit mantissa, BF16 has 7), and per-K scale fits BF16 dynamic range.
-    q_bf = q_values.to(torch.bfloat16)
-    k_bf = k_packed.to(torch.bfloat16) * k_scales.to(torch.bfloat16).unsqueeze(-1)
-    scores = torch.einsum("mhd,nd->mhn", q_bf, k_bf)
-    # Reduction across H needs FP32 for stability of weighted sum.
-    logits = (weights.to(torch.float32).unsqueeze(-1) * scores.to(torch.float32)).sum(dim=1)
-    n_idx = torch.arange(N, device=logits.device, dtype=cu_seqlen_ks.dtype)
-    valid = (n_idx.unsqueeze(0) >= cu_seqlen_ks.unsqueeze(1)) & (
-        n_idx.unsqueeze(0) < cu_seqlen_ke.unsqueeze(1)
-    )
-    fill = float("-inf") if clean_logits else 0.0
-    return torch.where(valid, logits, torch.full_like(logits, fill))
-
-
 def fp8_fp4_mqa_logits(
     q: tuple[torch.Tensor, torch.Tensor | None],
     kv: tuple[torch.Tensor, torch.Tensor],
@@ -523,19 +370,6 @@ def fp8_fp4_mqa_logits(
     Returns:
         Logits tensor of shape [M, N], dtype `torch.float32`.
     """
-    if _use_sm86_reference():
-        q_values, q_scale = q
-        k_packed, k_scales = kv
-        if q_scale is not None:
-            raise NotImplementedError(
-                "SM86 reference: FP4 MQA path not implemented. "
-                "Disable use_fp4_indexer_cache (omit "
-                "--attention_config.use_fp4_indexer_cache=True) or run on SM>=90."
-            )
-        return _fp8_mqa_logits_pyref(
-            q_values, k_packed, k_scales, weights,
-            cu_seqlen_ks, cu_seqlen_ke, clean_logits,
-        )
     _lazy_init()
     if _fp8_fp4_mqa_logits_impl is None:
         return _missing()
@@ -564,78 +398,10 @@ def get_paged_mqa_logits_metadata(
         Backend-specific tensor consumed by `fp8_fp4_paged_mqa_logits` to
         schedule work across SMs.
     """
-    if _use_sm86_reference():
-        # Pyref doesn't multi-SM schedule; return a placeholder.
-        return torch.zeros(1, dtype=torch.int32, device=context_lens.device)
     _lazy_init()
     if _get_paged_mqa_logits_metadata_impl is None:
         return _missing()
     return _get_paged_mqa_logits_metadata_impl(context_lens, block_size, num_sms)
-
-
-def _fp8_paged_mqa_logits_pyref(
-    q_values: torch.Tensor,
-    kv_cache: torch.Tensor,
-    weights: torch.Tensor,
-    context_lens: torch.Tensor,
-    block_tables: torch.Tensor,
-    max_model_len: int,
-    clean_logits: bool,
-) -> torch.Tensor:
-    """SM86 FP8 reference for fp8_fp4_paged_mqa_logits (FP8 q + FP8 paged KV).
-
-    q_values:     [B, next_n, H, D] float8_e4m3fn
-    kv_cache:     [num_blocks, block_size, 1, D+4] uint8
-                  (D bytes FP8 K + 4 bytes FP32 scale per slot)
-    weights:      [B*next_n, H] float32
-    context_lens: [B] int32 (or [B, next_n] — handle both)
-    block_tables: [B, max_blocks] int32
-    """
-    B, next_n, H, D = q_values.shape
-    M = B * next_n
-    block_size = kv_cache.shape[1]
-    fill = float("-inf") if clean_logits else 0.0
-    logits = torch.full(
-        (M, max_model_len), fill, dtype=torch.float32, device=q_values.device
-    )
-    # FP8→BF16 cast is exact; tensor cores fire on the einsum.
-    q_bf = q_values.to(torch.bfloat16).reshape(M, H, D)
-
-    # context_lens may be [B] or [B, next_n] — use the per-batch maximum
-    if context_lens.dim() == 2:
-        ctx_per_batch = context_lens.amax(dim=-1)
-    else:
-        ctx_per_batch = context_lens
-
-    cache_dim = kv_cache.shape[-1]
-    assert cache_dim == D + 4, (
-        f"kv_cache last dim {cache_dim} != D+4 ({D+4}); layout mismatch"
-    )
-
-    for b in range(B):
-        ctx = int(ctx_per_batch[b].item())
-        if ctx <= 0:
-            continue
-        n_blocks = (ctx + block_size - 1) // block_size
-        bt = block_tables[b, :n_blocks].to(torch.long)
-        rows = kv_cache[bt].reshape(n_blocks * block_size, cache_dim)[:ctx]
-        rows = rows.contiguous()
-        k_bytes = rows[:, :D].contiguous()
-        scale_bytes = rows[:, D : D + 4].contiguous()
-        scales = scale_bytes.view(torch.float32).squeeze(-1).to(torch.bfloat16)
-        k_fp8 = k_bytes.view(torch.float8_e4m3fn)
-        k_bf = k_fp8.to(torch.bfloat16) * scales.unsqueeze(-1)
-
-        m_start = b * next_n
-        m_end = m_start + next_n
-        q_b = q_bf[m_start:m_end]
-        scores = torch.einsum("mhd,nd->mhn", q_b, k_bf)
-        w_b = weights[m_start:m_end].to(torch.float32)
-        logits[m_start:m_end, :ctx] = (
-            w_b.unsqueeze(-1) * scores.to(torch.float32)
-        ).sum(dim=1)
-
-    return logits
 
 
 def fp8_fp4_paged_mqa_logits(
@@ -676,17 +442,6 @@ def fp8_fp4_paged_mqa_logits(
         Logits tensor of shape [B * next_n, max_model_len], dtype
         `torch.float32`.
     """
-    if _use_sm86_reference():
-        q_values, q_scale = q
-        if q_scale is not None:
-            raise NotImplementedError(
-                "SM86 reference: FP4 paged MQA path not implemented. "
-                "Disable use_fp4_indexer_cache or run on SM>=90."
-            )
-        return _fp8_paged_mqa_logits_pyref(
-            q_values, kv_cache, weights, context_lens,
-            block_tables, max_model_len, clean_logits,
-        )
     _lazy_init()
     if _fp8_fp4_paged_mqa_logits_impl is None:
         return _missing()
@@ -700,30 +455,6 @@ def fp8_fp4_paged_mqa_logits(
         max_model_len,
         clean_logits=clean_logits,
     )
-
-
-def _tf32_hc_prenorm_gemm_pyref(
-    x: torch.Tensor,
-    fn: torch.Tensor,
-    out: torch.Tensor,
-    sqrsum: torch.Tensor,
-    num_split: int,
-) -> torch.Tensor:
-    """SM86 reference for tf32_hc_prenorm_gemm.
-
-    The downstream fused op sums all `num_split` rows of `out`/`sqrsum`,
-    so the K-axis partitioning is mathematically arbitrary. We compute
-    the full GEMM/sqrsum into split 0 and zero the rest. This avoids the
-    divisibility constraint that would otherwise be required.
-    """
-    x_f = x.float()
-    fn_f = fn.float() if fn.dtype != torch.float32 else fn
-    out[0].copy_(x_f @ fn_f.t())
-    sqrsum[0].copy_(x_f.square().sum(-1))
-    if num_split > 1:
-        out[1:].zero_()
-        sqrsum[1:].zero_()
-    return out
 
 
 def tf32_hc_prenorm_gemm(
@@ -740,8 +471,6 @@ def tf32_hc_prenorm_gemm(
 
     See the caller function for shape requirement
     """
-    if _use_sm86_reference():
-        return _tf32_hc_prenorm_gemm_pyref(x, fn, out, sqrsum, num_split)
     _lazy_init()
     if _tf32_hc_prenorm_gemm_impl is None:
         return _missing()
