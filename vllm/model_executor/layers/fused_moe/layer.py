@@ -66,6 +66,24 @@ import numpy as np
 
 import vllm
 from vllm.envs import is_lk_moe_numa_enabled
+from vllm.model_executor.layers.fused_moe.lkmoe import (
+    LKMoE, MOE, MOE_WNA16Repack, MOE_FP8, MOE_Quant,
+    MOEConfig, MOE_WNA16RepackConfig, MOE_FP8Config, MOE_QuantConfig,
+    LKMoEConfig, LKMoeSerialGuard,
+)
+
+lk_moe = __import__('types').ModuleType('lk_moe')
+lk_moe.MOE = MOE
+lk_moe.MOE_WNA16Repack = MOE_WNA16Repack
+lk_moe.MOE_FP8 = MOE_FP8
+lk_moe.MOE_Quant = MOE_Quant
+lk_moe.MOEConfig = MOEConfig
+lk_moe.MOE_WNA16RepackConfig = MOE_WNA16RepackConfig
+lk_moe.MOE_FP8Config = MOE_FP8Config
+lk_moe.MOE_QuantConfig = MOE_QuantConfig
+lk_moe.LKMoEConfig = LKMoEConfig
+lk_moe.LKMoeSerialGuard = LKMoeSerialGuard
+
 if is_lk_moe_numa_enabled():
     GGML_TYPE_TO_TORCH_DTYPE = {
         0: torch.float32,    # GGML_TYPE_F32
@@ -1079,7 +1097,6 @@ class FusedMoE(PluggableLayer):
         routed_input_transform: torch.nn.Module | None = None,
         routed_output_transform: torch.nn.Module | None = None,
         apply_routed_scale_to_output: bool = False,
-        zero_expert_type: str | None = None,
         hash_indices_table: torch.Tensor | None = None,
     ):
         super().__init__()
