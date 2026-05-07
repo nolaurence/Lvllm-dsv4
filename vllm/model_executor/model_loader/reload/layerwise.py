@@ -318,12 +318,54 @@ def _layerwise_process(layer: torch.nn.Module, info: LayerReloadingInfo):
     # Process weights (quantization, repacking, etc.)
     quant_method = getattr(layer, "quant_method", None)
     if isinstance(quant_method, QuantizeMethodBase):
+        logger.debug(
+            "%s: calling %s.process_weights_after_loading",
+            layer.__class__.__name__,
+            quant_method.__class__.__name__,
+        )
         quant_method.process_weights_after_loading(layer)
 
-    # Copy processed values into original tensor storage (preserves cudagraph refs)
-    # this code is a no-op if not reloading (because kernel tensors is empty)
+    # Copy processed values into original tensor storage (preserves cudagraph refs).
+    # Only safe when the quant method did NOT change tensor shapes.
+    # FusedMoE in INT4 mode: shapes unchanged → copy is safe.
+    # Linear layers (FP8 Marlin etc.): shapes changed → skip copy,
+    #   the processed parameters stay on the layer as-is.
     if info.kernel_tensors is not None:
-        _copy_and_restore_kernel_tensors(layer, info)
+        from vllm.model_executor.layers.fused_moe import FusedMoE
+
+        if isinstance(layer, FusedMoE) or quant_method is None:
+            # When kernel tensors are on meta device (first load with
+            # layerwise loading), they cannot hold data. Skip the copy and
+            # keep the materialized tensors on the layer so that downstream
+            # processing (e.g. MXFP4→INT4 conversion in
+            # FusedMoE.process_weights_after_loading) can read the loaded
+            # weight data.
+            kernel_params = info.kernel_tensors[0]
+            if kernel_params and all(
+                p.device.type == "meta" for p in kernel_params.values()
+            ):
+                logger.debug(
+                    "%s: skipping kernel tensor copy (kernel tensors on "
+                    "meta device)",
+                    layer.__class__.__name__,
+                )
+            else:
+                logger.debug(
+                    "%s: copying %d kernel parameters back",
+                    layer.__class__.__name__,
+                    len(info.kernel_tensors[0]),
+                )
+                _copy_and_restore_kernel_tensors(layer, info)
+        else:
+            # Non-MoE quant layer (e.g. ColumnParallelLinear with FP8):
+            # quant processing may have changed shapes — keep the
+            # processed parameters on the layer, discard old kernel tensors.
+            logger.debug(
+                "%s: skipping kernel tensor copy-back (quant method %s may "
+                "have changed tensor shapes)",
+                layer.__class__.__name__,
+                quant_method.__class__.__name__,
+            )
 
     info.reset()
     logger.debug("%s: Processed", layer.__class__.__name__)
@@ -348,7 +390,15 @@ def _copy_and_restore_kernel_tensors(layer: torch.nn.Module, info: LayerReloadin
     assert info.kernel_tensors is not None
     parameters, buffers = info.kernel_tensors
     for name, param in parameters.items():
-        param.data.copy_(getattr(layer, name))
+        try:
+            param.data.copy_(getattr(layer, name))
+        except RuntimeError as e:
+            processed = getattr(layer, name)
+            raise RuntimeError(
+                f"Layer {layer.__class__.__name__} param '{name}': "
+                f"kernel shape {tuple(param.shape)}, "
+                f"processed shape {tuple(processed.shape)}"
+            ) from e
     for name, buffer in buffers.items():
         buffer.data.copy_(getattr(layer, name))
 

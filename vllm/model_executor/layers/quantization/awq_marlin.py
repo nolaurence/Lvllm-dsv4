@@ -520,11 +520,11 @@ class AWQMarlinMoEMethod(FusedMoEMethodBase):
         params_dtype: torch.dtype,
         **extra_weight_attrs,
     ):
-        from vllm.envs import is_lk_moe_numa_enabled
+        from vllm.envs import is_lk_moe_numa_enabled, is_moe_layerwise_load_enabled
         device = torch.cuda.current_device() if current_platform.is_cuda_alike() else "cpu"
         origin_device = device
         if isinstance(layer, FusedMoE) and is_lk_moe_numa_enabled():
-            device = "cpu"
+            device = "meta" if is_moe_layerwise_load_enabled() else "cpu"
         layer.input_dtype = self.input_dtype
         extra_weight_attrs.update(
             {

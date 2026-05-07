@@ -625,10 +625,10 @@ class CompressedTensorsW8A8Fp8MoEMethod(CompressedTensorsMoEMethod):
                        hidden_size: int, intermediate_size_per_partition: int,
                        params_dtype: torch.dtype, **extra_weight_attrs):
 
-        from vllm.envs import is_lk_moe_numa_enabled
+        from vllm.envs import is_lk_moe_numa_enabled, is_moe_layerwise_load_enabled
         device = torch.cuda.current_device() if current_platform.is_cuda_alike() else "cpu"
         if isinstance(layer, FusedMoE) and is_lk_moe_numa_enabled():
-            device = "cpu"
+            device = "meta" if is_moe_layerwise_load_enabled() else "cpu"
         layer.intermediate_size_per_partition = intermediate_size_per_partition
         layer.hidden_size = hidden_size
         layer.num_experts = num_experts

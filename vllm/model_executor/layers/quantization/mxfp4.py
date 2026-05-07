@@ -4,6 +4,11 @@
 import torch
 
 from vllm.config import get_current_vllm_config
+from vllm.envs import (
+    get_moe_use_weight,
+    is_lk_moe_numa_enabled,
+    is_moe_layerwise_load_enabled,
+)
 from vllm.logger import init_logger
 from vllm.model_executor.layers.attention import Attention
 from vllm.model_executor.layers.fused_moe import (
@@ -35,6 +40,7 @@ from vllm.model_executor.layers.quantization.base_config import (
 )
 from vllm.model_executor.layers.quantization.utils.quant_utils import is_layer_skipped
 from vllm.model_executor.utils import replace_parameter, set_weight_attrs
+from vllm.platforms import current_platform
 
 logger = init_logger(__name__)
 
@@ -190,6 +196,10 @@ class GptOssMxfp4MoEMethod(FusedMoEMethodBase):
         scale_dtype = torch.uint8
         mxfp4_block = 32
 
+        device = torch.cuda.current_device() if current_platform.is_cuda_alike() else "cpu"
+        if isinstance(layer, FusedMoE) and is_lk_moe_numa_enabled():
+            device = "meta" if is_moe_layerwise_load_enabled() else "cpu"
+
         layer.params_dtype = params_dtype
         layer.num_experts = num_experts
         self.intermediate_size = intermediate_size_per_partition
@@ -202,6 +212,7 @@ class GptOssMxfp4MoEMethod(FusedMoEMethodBase):
                 2 * intermediate_size_per_partition,
                 hidden_size // 2,
                 dtype=weight_dtype,
+                device=device,
             ),
             requires_grad=False,
         )
@@ -214,6 +225,7 @@ class GptOssMxfp4MoEMethod(FusedMoEMethodBase):
                 2 * intermediate_size_per_partition,
                 hidden_size // mxfp4_block,
                 dtype=scale_dtype,
+                device=device,
             ),
             requires_grad=False,
         )
@@ -228,6 +240,7 @@ class GptOssMxfp4MoEMethod(FusedMoEMethodBase):
                 hidden_size,
                 intermediate_size_per_partition // 2,
                 dtype=weight_dtype,
+                device=device,
             ),
             requires_grad=False,
         )
@@ -240,6 +253,7 @@ class GptOssMxfp4MoEMethod(FusedMoEMethodBase):
                 hidden_size,
                 intermediate_size_per_partition // mxfp4_block,
                 dtype=scale_dtype,
+                device=device,
             ),
             requires_grad=False,
         )
@@ -253,6 +267,7 @@ class GptOssMxfp4MoEMethod(FusedMoEMethodBase):
                     num_experts,
                     2 * intermediate_size_per_partition,
                     dtype=torch.bfloat16,
+                    device=device,
                 ),
                 requires_grad=False,
             )
@@ -264,6 +279,7 @@ class GptOssMxfp4MoEMethod(FusedMoEMethodBase):
                     num_experts,
                     hidden_size,
                     dtype=torch.bfloat16,
+                    device=device,
                 ),
                 requires_grad=False,
             )
@@ -377,6 +393,17 @@ class GptOssMxfp4MoEMethod(FusedMoEMethodBase):
         w2_bias = getattr(layer, "w2_bias", None)
 
         if self.mxfp4_backend == Mxfp4MoeBackend.NONE:
+            return
+
+        # When lkmoe INT4 path is active, skip MXFP4 kernel setup so the raw
+        # MXFP4 weights remain available for dequantization + int4 re-quant.
+        if is_lk_moe_numa_enabled() and get_moe_use_weight().upper() == "INT4":
+            logger.info_once(
+                "MXFP4 INT4 mode: skipping kernel setup, keeping raw MXFP4 "
+                "weights for later dequantization on layer %s.",
+                layer.layer_name if hasattr(layer, "layer_name")
+                else layer.__class__.__name__,
+            )
             return
 
         self._setup_kernel(layer, w13, w2, w13_scale, w2_scale, w13_bias, w2_bias)
@@ -516,6 +543,10 @@ class Mxfp4MoEMethod(FusedMoEMethodBase):
         scale_dtype = torch.uint8
         mxfp4_block = 32
 
+        device = torch.cuda.current_device() if current_platform.is_cuda_alike() else "cpu"
+        if isinstance(layer, FusedMoE) and is_lk_moe_numa_enabled():
+            device = "meta" if is_moe_layerwise_load_enabled() else "cpu"
+
         layer.params_dtype = params_dtype
         layer.num_experts = num_experts
         self.intermediate_size = intermediate_size_per_partition
@@ -528,6 +559,7 @@ class Mxfp4MoEMethod(FusedMoEMethodBase):
                 2 * intermediate_size_per_partition,
                 hidden_size // 2,
                 dtype=weight_dtype,
+                device=device,
             ),
             requires_grad=False,
         )
@@ -540,6 +572,7 @@ class Mxfp4MoEMethod(FusedMoEMethodBase):
                 2 * intermediate_size_per_partition,
                 hidden_size // mxfp4_block,
                 dtype=scale_dtype,
+                device=device,
             ),
             requires_grad=False,
         )
@@ -554,6 +587,7 @@ class Mxfp4MoEMethod(FusedMoEMethodBase):
                 hidden_size,
                 intermediate_size_per_partition // 2,
                 dtype=weight_dtype,
+                device=device,
             ),
             requires_grad=False,
         )
@@ -566,6 +600,7 @@ class Mxfp4MoEMethod(FusedMoEMethodBase):
                 hidden_size,
                 intermediate_size_per_partition // mxfp4_block,
                 dtype=scale_dtype,
+                device=device,
             ),
             requires_grad=False,
         )
@@ -579,6 +614,7 @@ class Mxfp4MoEMethod(FusedMoEMethodBase):
                     num_experts,
                     2 * intermediate_size_per_partition,
                     dtype=torch.bfloat16,
+                    device=device,
                 ),
                 requires_grad=False,
             )
@@ -590,6 +626,7 @@ class Mxfp4MoEMethod(FusedMoEMethodBase):
                     num_experts,
                     hidden_size,
                     dtype=torch.bfloat16,
+                    device=device,
                 ),
                 requires_grad=False,
             )
@@ -703,6 +740,17 @@ class Mxfp4MoEMethod(FusedMoEMethodBase):
         w2_bias = getattr(layer, "w2_bias", None)
 
         if self.mxfp4_backend == Mxfp4MoeBackend.NONE:
+            return
+
+        # When lkmoe INT4 path is active, skip MXFP4 kernel setup so the raw
+        # MXFP4 weights remain available for dequantization + int4 re-quant.
+        if is_lk_moe_numa_enabled() and get_moe_use_weight().upper() == "INT4":
+            logger.info_once(
+                "MXFP4 INT4 mode: skipping kernel setup, keeping raw MXFP4 "
+                "weights for later dequantization on layer %s.",
+                layer.layer_name if hasattr(layer, "layer_name")
+                else layer.__class__.__name__,
+            )
             return
 
         self._setup_kernel(layer, w13, w2, w13_scale, w2_scale, w13_bias, w2_bias)

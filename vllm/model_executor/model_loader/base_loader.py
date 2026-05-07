@@ -9,7 +9,12 @@ import vllm.envs as envs
 from vllm.config import ModelConfig, VllmConfig
 from vllm.config.load import LoadConfig
 from vllm.logger import init_logger
-from vllm.model_executor.model_loader.reload import finalize_layerwise_processing
+from vllm.envs import is_lk_moe_numa_enabled, is_moe_layerwise_load_enabled
+from vllm.model_executor.model_loader.reload import (
+    finalize_layerwise_processing,
+    get_layerwise_info,
+    initialize_layerwise_reload,
+)
 from vllm.model_executor.model_loader.utils import (
     initialize_model,
     process_weights_after_loading,
@@ -60,6 +65,34 @@ class BaseModelLoader(ABC):
 
             log_model_inspection(model)
 
+            # When lkmoe CPU offloading is enabled with layerwise loading,
+            # initialize layerwise reload so MoE layers are kept on meta device
+            # and materialized to CPU one layer at a time during weight loading.
+            # This avoids allocating all expert weights in RAM simultaneously.
+            _is_lkmoe_layerwise = (
+                is_lk_moe_numa_enabled() and is_moe_layerwise_load_enabled()
+            )
+            if _is_lkmoe_layerwise:
+                from vllm.model_executor.layers.fused_moe import FusedMoE
+
+                # record_metadata_for_reloading is already called in
+                # initialize_model(), but we need to override restore_device
+                # for MoE layers to CPU (they were set to CUDA during model
+                # init inside the `with target_device:` block).
+                for module in model.modules():
+                    if isinstance(module, FusedMoE):
+                        get_layerwise_info(module).restore_device = torch.device(
+                            "cpu"
+                        )
+
+                # Put all layers on meta device and wrap weight loaders so
+                # layers are materialized one-at-a-time as weights arrive.
+                initialize_layerwise_reload(model)
+                logger.info(
+                    "LKMoE layerwise load enabled: MoE weights will be "
+                    "materialized to CPU one layer at a time."
+                )
+
             logger.debug("Loading weights on %s ...", load_device)
             self.load_weights(model, model_config)
 
@@ -74,7 +107,7 @@ class BaseModelLoader(ABC):
 
             # Process weights into kernel format. Note that when using online
             # quantization, weights are (typically) quantized as they are loaded.
-            if _has_online_quant(model):
+            if _has_online_quant(model) or _is_lkmoe_layerwise:
                 finalize_layerwise_processing(model, model_config)
 
             process_weights_after_loading(model, model_config, target_device)
