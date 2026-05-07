@@ -255,6 +255,21 @@ include(FetchContent)
 file(MAKE_DIRECTORY ${FETCHCONTENT_BASE_DIR}) # Ensure the directory exists
 message(STATUS "FetchContent base directory: ${FETCHCONTENT_BASE_DIR}")
 
+#
+# When VLLM_FETCH_DEPS_DIR is set, skip git download for all dependencies
+# and use pre-cloned repos under that directory (e.g. ${VLLM_FETCH_DEPS_DIR}/llama_cpp-src/)
+#
+if(VLLM_FETCH_DEPS_DIR)
+  message(STATUS "VLLM_FETCH_DEPS_DIR is set, using local repos from ${VLLM_FETCH_DEPS_DIR}")
+  set(ENV{VLLM_LLAMA_CPP_SRC_DIR}      "${VLLM_FETCH_DEPS_DIR}/llama_cpp-src")
+  set(ENV{VLLM_CUTLASS_SRC_DIR}         "${VLLM_FETCH_DEPS_DIR}/cutlass-src")
+  set(ENV{QUTLASS_SRC_DIR}              "${VLLM_FETCH_DEPS_DIR}/qutlass-src")
+  set(ENV{VLLM_FLASH_ATTN_SRC_DIR}      "${VLLM_FETCH_DEPS_DIR}/vllm-flash-attn-src")
+  set(ENV{TRITON_KERNELS_SRC_DIR}       "${VLLM_FETCH_DEPS_DIR}/triton_kernels-src")
+  set(ENV{FLASH_MLA_SRC_DIR}            "${VLLM_FETCH_DEPS_DIR}/flashmla-src")
+  set(ENV{DEEPGEMM_SRC_DIR}             "${VLLM_FETCH_DEPS_DIR}/deepgemm-src")
+endif()
+
 if(VLLM_GPU_LANG STREQUAL "HIP")
   #
   # Overriding the default -O set up by cmake, adding ggdb3 for the most verbose devug info
