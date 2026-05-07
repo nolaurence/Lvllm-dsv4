@@ -252,6 +252,14 @@ endif()
 # conflicts between build types. It should instead be set to ${CMAKE_BINARY_DIR}/<dependency>.
 #
 include(FetchContent)
+
+# Prevent FetchContent from re-downloading already-populated dependencies on
+# every build. When ON, FetchContent only downloads if the source directory
+# does not yet exist. To force a re-download (e.g. after updating commit tags),
+# delete the .deps directory and rebuild.
+set(FETCHCONTENT_UPDATES_DISCONNECTED ON CACHE BOOL
+  "Skip update checks for already-populated FetchContent dependencies")
+
 file(MAKE_DIRECTORY ${FETCHCONTENT_BASE_DIR}) # Ensure the directory exists
 message(STATUS "FetchContent base directory: ${FETCHCONTENT_BASE_DIR}")
 
@@ -307,13 +315,19 @@ if(VLLM_LLAMA_CPP_SRC_DIR)
   message(STATUS "The VLLM_LLAMA_CPP_SRC_DIR is set, using ${VLLM_LLAMA_CPP_SRC_DIR} for compilation")
   FetchContent_Declare(llama_cpp SOURCE_DIR ${VLLM_LLAMA_CPP_SRC_DIR})
 else()
-  FetchContent_Declare(
-      llama_cpp
-      GIT_REPOSITORY https://github.com/ggerganov/llama.cpp.git
-      GIT_TAG ${LLAMA_CPP_REVISION}
-      GIT_PROGRESS TRUE 
-      GIT_SHALLOW FALSE
-  )
+  # Check if existing source already has the expected commit; if so, skip download
+  vllm_use_existing_source_if_commit_matches(NAME llama_cpp EXPECTED_TAG ${LLAMA_CPP_REVISION})
+  if(llama_cpp_SOURCE_DIR)
+    FetchContent_Declare(llama_cpp SOURCE_DIR ${llama_cpp_SOURCE_DIR})
+  else()
+    FetchContent_Declare(
+        llama_cpp
+        GIT_REPOSITORY https://github.com/ggerganov/llama.cpp.git
+        GIT_TAG ${LLAMA_CPP_REVISION}
+        GIT_PROGRESS TRUE 
+        GIT_SHALLOW FALSE
+    )
+  endif()
 endif()
 string(TIMESTAMP _ts "%Y-%m-%d %H:%M:%S")
 message(STATUS "[${_ts}] >>> FetchContent: downloading llama_cpp (llama.cpp) ...")
@@ -416,18 +430,24 @@ if(VLLM_GPU_LANG STREQUAL "CUDA")
     message(STATUS "The VLLM_CUTLASS_SRC_DIR is set, using ${VLLM_CUTLASS_SRC_DIR} for compilation")
     FetchContent_Declare(cutlass SOURCE_DIR ${VLLM_CUTLASS_SRC_DIR})
   else()
-    FetchContent_Declare(
-        cutlass
-        GIT_REPOSITORY https://github.com/nvidia/cutlass.git
-        # Please keep this in sync with CUTLASS_REVISION line above.
-        GIT_TAG ${CUTLASS_REVISION}
-        GIT_PROGRESS TRUE
+    # Check if existing source already has the expected tag; if so, skip download
+    vllm_use_existing_source_if_commit_matches(NAME cutlass EXPECTED_TAG ${CUTLASS_REVISION})
+    if(cutlass_SOURCE_DIR)
+      FetchContent_Declare(cutlass SOURCE_DIR ${cutlass_SOURCE_DIR})
+    else()
+      FetchContent_Declare(
+          cutlass
+          GIT_REPOSITORY https://github.com/nvidia/cutlass.git
+          # Please keep this in sync with CUTLASS_REVISION line above.
+          GIT_TAG ${CUTLASS_REVISION}
+          GIT_PROGRESS TRUE
 
-        # Speed up CUTLASS download by retrieving only the specified GIT_TAG instead of the history.
-        # Important: If GIT_SHALLOW is enabled then GIT_TAG works only with branch names and tags.
-        # So if the GIT_TAG above is updated to a commit hash, GIT_SHALLOW must be set to FALSE
-        GIT_SHALLOW TRUE
-    )
+          # Speed up CUTLASS download by retrieving only the specified GIT_TAG instead of the history.
+          # Important: If GIT_SHALLOW is enabled then GIT_TAG works only with branch names and tags.
+          # So if the GIT_TAG above is updated to a commit hash, GIT_SHALLOW must be set to FALSE
+          GIT_SHALLOW TRUE
+      )
+    endif()
   endif()
   string(TIMESTAMP _ts "%Y-%m-%d %H:%M:%S")
   message(STATUS "[${_ts}] >>> FetchContent: downloading cutlass ...")

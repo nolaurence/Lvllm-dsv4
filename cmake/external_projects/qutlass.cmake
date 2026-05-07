@@ -6,6 +6,8 @@ if(DEFINED ENV{QUTLASS_SRC_DIR})
   set(QUTLASS_SRC_DIR $ENV{QUTLASS_SRC_DIR})
 endif()
 
+set(QUTLASS_EXPECTED_TAG "830d2c4537c7396e14a02a46fbddd18b5d107c65")
+
 if(QUTLASS_SRC_DIR)
   FetchContent_Declare(
     qutlass
@@ -14,14 +16,25 @@ if(QUTLASS_SRC_DIR)
     BUILD_COMMAND ""
   )
 else()
-  FetchContent_Declare(
-    qutlass
-    GIT_REPOSITORY https://github.com/IST-DASLab/qutlass.git
-    GIT_TAG 830d2c4537c7396e14a02a46fbddd18b5d107c65
-    GIT_PROGRESS TRUE
-    CONFIGURE_COMMAND ""
-    BUILD_COMMAND ""
-  )
+  # Check if existing source already has the expected commit; if so, skip download
+  vllm_use_existing_source_if_commit_matches(NAME qutlass EXPECTED_TAG ${QUTLASS_EXPECTED_TAG})
+  if(qutlass_SOURCE_DIR)
+    FetchContent_Declare(
+      qutlass
+      SOURCE_DIR ${qutlass_SOURCE_DIR}
+      CONFIGURE_COMMAND ""
+      BUILD_COMMAND ""
+    )
+  else()
+    FetchContent_Declare(
+      qutlass
+      GIT_REPOSITORY https://github.com/IST-DASLab/qutlass.git
+      GIT_TAG ${QUTLASS_EXPECTED_TAG}
+      GIT_PROGRESS TRUE
+      CONFIGURE_COMMAND ""
+      BUILD_COMMAND ""
+    )
+  endif()
 endif()
 
 string(TIMESTAMP _ts "%Y-%m-%d %H:%M:%S")

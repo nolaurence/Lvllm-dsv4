@@ -8,6 +8,8 @@ if (DEFINED ENV{DEEPGEMM_SRC_DIR})
   set(DEEPGEMM_SRC_DIR $ENV{DEEPGEMM_SRC_DIR})
 endif()
 
+set(DEEPGEMM_EXPECTED_TAG "891d57b4db1071624b5c8fa0d1e51cb317fa709f")
+
 if(DEEPGEMM_SRC_DIR)
   FetchContent_Declare(
     deepgemm
@@ -16,16 +18,27 @@ if(DEEPGEMM_SRC_DIR)
     BUILD_COMMAND ""
   )
 else()
-  # This ref should be kept in sync with tools/install_deepgemm.sh
-  FetchContent_Declare(
-    deepgemm
-    GIT_REPOSITORY https://github.com/deepseek-ai/DeepGEMM.git
-    GIT_TAG 891d57b4db1071624b5c8fa0d1e51cb317fa709f
-    GIT_SUBMODULES "third-party/cutlass" "third-party/fmt"
-    GIT_PROGRESS TRUE
-    CONFIGURE_COMMAND ""
-    BUILD_COMMAND ""
-  )
+  # Check if existing source already has the expected commit; if so, skip download
+  vllm_use_existing_source_if_commit_matches(NAME deepgemm EXPECTED_TAG ${DEEPGEMM_EXPECTED_TAG})
+  if(deepgemm_SOURCE_DIR)
+    FetchContent_Declare(
+      deepgemm
+      SOURCE_DIR ${deepgemm_SOURCE_DIR}
+      CONFIGURE_COMMAND ""
+      BUILD_COMMAND ""
+    )
+  else()
+    # This ref should be kept in sync with tools/install_deepgemm.sh
+    FetchContent_Declare(
+      deepgemm
+      GIT_REPOSITORY https://github.com/deepseek-ai/DeepGEMM.git
+      GIT_TAG ${DEEPGEMM_EXPECTED_TAG}
+      GIT_SUBMODULES "third-party/cutlass" "third-party/fmt"
+      GIT_PROGRESS TRUE
+      CONFIGURE_COMMAND ""
+      BUILD_COMMAND ""
+    )
+  endif()
 endif()
 
 # Use FetchContent_Populate (not MakeAvailable) to avoid processing

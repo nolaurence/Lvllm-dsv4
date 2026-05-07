@@ -338,6 +338,75 @@ endmacro()
 #   cuda_archs_loose_intersection(OUT_CUDA_ARCHS SRC_CUDA_ARCHS TGT_CUDA_ARCHS)
 #   OUT_CUDA_ARCHS="8.0+PTX"
 #
+#
+# Check if an existing FetchContent source directory already has the expected
+# git commit. If it does, set <NAME>_SOURCE_DIR so FetchContent_Declare can
+# use SOURCE_DIR to skip the download entirely.
+#
+# Usage:
+#   vllm_use_existing_source_if_commit_matches(
+#     NAME <name>
+#     EXPECTED_TAG <tag|commit-hash>
+#   )
+#
+#   if(<name>_SOURCE_DIR)
+#     FetchContent_Declare(<name> SOURCE_DIR ${<name>_SOURCE_DIR} ...)
+#   else()
+#     FetchContent_Declare(<name> GIT_REPOSITORY ... GIT_TAG ...)
+#   endif()
+#
+function(vllm_use_existing_source_if_commit_matches)
+  cmake_parse_arguments(ARG "" "NAME;EXPECTED_TAG" "" ${ARGN})
+  set(_src_dir "${FETCHCONTENT_BASE_DIR}/${ARG_NAME}-src")
+
+  if(NOT EXISTS "${_src_dir}/.git")
+    set(${ARG_NAME}_SOURCE_DIR "" PARENT_SCOPE)
+    return()
+  endif()
+
+  # Resolve the expected commit hash from the tag (handles both tags and hashes)
+  execute_process(
+    COMMAND git -C "${_src_dir}" rev-parse "${ARG_EXPECTED_TAG}"
+    OUTPUT_VARIABLE _expected_commit
+    OUTPUT_STRIP_TRAILING_WHITESPACE
+    ERROR_QUIET
+    RESULT_VARIABLE _resolve_ret
+  )
+
+  # Get the current HEAD commit
+  execute_process(
+    COMMAND git -C "${_src_dir}" rev-parse HEAD
+    OUTPUT_VARIABLE _actual_commit
+    OUTPUT_STRIP_TRAILING_WHITESPACE
+    ERROR_QUIET
+    RESULT_VARIABLE _actual_ret
+  )
+
+  if(_resolve_ret EQUAL 0 AND _actual_ret EQUAL 0 AND
+     _actual_commit STREQUAL _expected_commit)
+    message(STATUS "[${ARG_NAME}] Reusing existing source at ${_src_dir} (commit ${_actual_commit})")
+    set(${ARG_NAME}_SOURCE_DIR "${_src_dir}" PARENT_SCOPE)
+  else()
+    message(STATUS "[${ARG_NAME}] Existing source at ${_src_dir} needs update "
+                    "(expected ${ARG_EXPECTED_TAG}, got ${_actual_commit}). Will re-download.")
+    set(${ARG_NAME}_SOURCE_DIR "" PARENT_SCOPE)
+  endif()
+endfunction()
+
+#
+# Backward-compatible wrapper: check if source exists with correct commit
+# before FetchContent download. Use the result to decide whether to pass
+# SOURCE_DIR or GIT_REPOSITORY+GIT_TAG to FetchContent_Declare.
+#
+# This is a convenience function that calls
+# vllm_use_existing_source_if_commit_matches internally and stores the result
+# in ${NAME}_EXISTING_SOURCE.
+#
+function(vllm_check_existing_source NAME EXPECTED_TAG)
+  vllm_use_existing_source_if_commit_matches(NAME ${NAME} EXPECTED_TAG ${EXPECTED_TAG})
+  # The result is already in ${NAME}_SOURCE_DIR in parent scope.
+endfunction()
+
 function(cuda_archs_loose_intersection OUT_CUDA_ARCHS SRC_CUDA_ARCHS TGT_CUDA_ARCHS)
   set(_SRC_CUDA_ARCHS "${SRC_CUDA_ARCHS}")
   set(_TGT_CUDA_ARCHS ${TGT_CUDA_ARCHS})

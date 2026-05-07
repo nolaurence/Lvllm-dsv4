@@ -8,6 +8,8 @@ if (DEFINED ENV{FLASH_MLA_SRC_DIR})
   set(FLASH_MLA_SRC_DIR $ENV{FLASH_MLA_SRC_DIR})
 endif()
 
+set(FLASHMLA_EXPECTED_TAG "a6ec2ba7bd0a7dff98b3f4d3e6b52b159c48d78b")
+
 if(FLASH_MLA_SRC_DIR)
   FetchContent_Declare(
         flashmla 
@@ -16,14 +18,25 @@ if(FLASH_MLA_SRC_DIR)
         BUILD_COMMAND ""
   )
 else()
-  FetchContent_Declare(
-        flashmla
-        GIT_REPOSITORY https://github.com/vllm-project/FlashMLA
-        GIT_TAG a6ec2ba7bd0a7dff98b3f4d3e6b52b159c48d78b
-        GIT_PROGRESS TRUE
-        CONFIGURE_COMMAND ""
-        BUILD_COMMAND ""
-  )
+  # Check if existing source already has the expected commit; if so, skip download
+  vllm_use_existing_source_if_commit_matches(NAME flashmla EXPECTED_TAG ${FLASHMLA_EXPECTED_TAG})
+  if(flashmla_SOURCE_DIR)
+    FetchContent_Declare(
+          flashmla
+          SOURCE_DIR ${flashmla_SOURCE_DIR}
+          CONFIGURE_COMMAND ""
+          BUILD_COMMAND ""
+    )
+  else()
+    FetchContent_Declare(
+          flashmla
+          GIT_REPOSITORY https://github.com/vllm-project/FlashMLA
+          GIT_TAG ${FLASHMLA_EXPECTED_TAG}
+          GIT_PROGRESS TRUE
+          CONFIGURE_COMMAND ""
+          BUILD_COMMAND ""
+    )
+  endif()
 endif()
 
 
