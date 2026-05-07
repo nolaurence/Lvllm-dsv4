@@ -138,76 +138,6 @@ def quantize_and_insert_k_kernel(
         tl.store(bf16_out_ptr + chunk_offsets, bf16_vals)
 
 
-def _quantize_and_insert_k_cache_pyref(
-    k: torch.Tensor,
-    k_cache: torch.Tensor,
-    slot_mapping: torch.Tensor,
-    block_size: int,
-) -> None:
-    """Vectorized: per-token Python loop replaced with batched scatter."""
-    TOKEN_FP8_DIM = 448
-    TOKEN_BF16_DIM = 64
-    TOKEN_SCALE_DIM = 8
-    QUANT_BLOCK_SIZE = 64
-    FP8_MAX = 448.0
-    TOKEN_DATA_SIZE = TOKEN_FP8_DIM + TOKEN_BF16_DIM * 2  # 576
-    N_QUANT_BLOCKS = TOKEN_FP8_DIM // QUANT_BLOCK_SIZE  # 7
-
-    num_tokens = slot_mapping.shape[0]
-    if num_tokens == 0:
-        return
-
-    device = k.device
-    valid_mask = slot_mapping >= 0
-    valid_idx = valid_mask.nonzero(as_tuple=True)[0]
-    if valid_idx.numel() == 0:
-        return
-
-    k_v = k[valid_idx]
-    slot_v = slot_mapping[valid_idx].long()
-    block_idx = slot_v // block_size
-    pos_in_block = slot_v % block_size
-    Nv = valid_idx.numel()
-
-    fp8_part = k_v[:, :TOKEN_FP8_DIM].to(torch.float32).view(
-        Nv, N_QUANT_BLOCKS, QUANT_BLOCK_SIZE
-    )
-    absmax = fp8_part.abs().amax(dim=-1).clamp_min(1e-4)
-    exponent = torch.ceil(torch.log2(absmax / FP8_MAX))
-    scale = torch.pow(2.0, exponent)
-    x_quant = torch.clamp(
-        fp8_part / scale.unsqueeze(-1), -FP8_MAX, FP8_MAX
-    ).to(torch.float8_e4m3fn)
-    x_quant_bytes = x_quant.view(torch.uint8).reshape(Nv, TOKEN_FP8_DIM)
-
-    bf16_bytes = k_v[:, TOKEN_FP8_DIM:].contiguous().view(torch.uint8)
-    data_payload = torch.cat([x_quant_bytes, bf16_bytes], dim=1)  # [Nv, 576]
-
-    scale_encoded = (exponent + 127.0).clamp(0.0, 255.0).to(torch.uint8)
-    scale_payload = torch.zeros(
-        Nv, TOKEN_SCALE_DIM, dtype=torch.uint8, device=device
-    )
-    scale_payload[:, :N_QUANT_BLOCKS] = scale_encoded
-
-    cache_flat = k_cache.reshape(k_cache.shape[0], -1)
-    block_stride = cache_flat.shape[-1]
-    cache_flat_1d = cache_flat.reshape(-1)
-
-    arange_data = torch.arange(TOKEN_DATA_SIZE, device=device)
-    arange_scale = torch.arange(TOKEN_SCALE_DIM, device=device)
-
-    data_base = block_idx * block_stride + pos_in_block * TOKEN_DATA_SIZE
-    data_idx = (data_base.unsqueeze(-1) + arange_data).flatten()
-    cache_flat_1d[data_idx] = data_payload.flatten()
-
-    scale_base_off = block_size * TOKEN_DATA_SIZE
-    scale_base = (
-        block_idx * block_stride + scale_base_off + pos_in_block * TOKEN_SCALE_DIM
-    )
-    scale_idx = (scale_base.unsqueeze(-1) + arange_scale).flatten()
-    cache_flat_1d[scale_idx] = scale_payload.flatten()
-
-
 def quantize_and_insert_k_cache(
     k: torch.Tensor,  # [num_tokens, 512] bf16
     k_cache: torch.Tensor,  # [num_blocks, block_bytes] uint8
@@ -230,15 +160,6 @@ def quantize_and_insert_k_cache(
     )
     assert k.dtype == torch.bfloat16, f"K must be bf16, got {k.dtype}"
     assert is_ue8m0, "Only support ue8m0 quantization."
-
-    try:
-        from vllm.utils.deep_gemm import _use_sm86_reference
-        if _use_sm86_reference():
-            return torch.ops.vllm.deepseek_v4_quant_insert_k_cache_sm86(
-                k, k_cache, slot_mapping, block_size,
-            )
-    except ImportError:
-        pass
 
     # NOTE: When using DP, slot_mapping.shape[0] can be less than k.shape[0] due to
     # padding. Always use slot_mapping.shape[0] as the token count.
@@ -382,103 +303,6 @@ def _dequantize_and_gather_k_kernel(
             tl.store(output_row_ptr + bf16_output_offset + chunk_offsets, bf16_vals)
 
 
-def _dequantize_and_gather_k_cache_pyref(
-    out: torch.Tensor,
-    k_cache: torch.Tensor,
-    seq_lens: torch.Tensor,
-    gather_lens: torch.Tensor | None,
-    block_table: torch.Tensor,
-    block_size: int,
-    offset: int,
-) -> None:
-    """Vectorized SM86 reference for dequantize_and_gather_k_cache.
-
-    Per-block layout (block_stride bytes total):
-      [0 : block_size * 576]  per-token data:
-                                [0:448]   fp8 (uint8 storage, 7×64 groups)
-                                [448:576] 64 bf16 (128 bytes)
-      [block_size * 576 : ...] per-token UE8M0 scales (8 bytes; 7 used)
-    """
-    TOKEN_FP8_DIM = 448
-    TOKEN_BF16_DIM = 64
-    TOKEN_SCALE_DIM = 8
-    QUANT_BLOCK_SIZE = 64
-    TOKEN_DATA_SIZE = TOKEN_FP8_DIM + TOKEN_BF16_DIM * 2  # 576
-    N_QUANT_BLOCKS = TOKEN_FP8_DIM // QUANT_BLOCK_SIZE  # 7
-
-    num_reqs = seq_lens.shape[0]
-    if num_reqs == 0:
-        return
-    device = k_cache.device
-
-    seq_lens_l = seq_lens.long()
-    gls = (
-        gather_lens.long() if gather_lens is not None else seq_lens_l
-    )
-    starts = seq_lens_l - gls
-
-    N_total = int(gls.sum().item())
-    if N_total == 0:
-        return
-
-    # Build flat (req, within-req-token) indices via repeat + cumsum trick.
-    cum = torch.zeros(num_reqs + 1, dtype=torch.long, device=device)
-    cum[1:] = gls.cumsum(0)
-    req_repeats = torch.repeat_interleave(
-        torch.arange(num_reqs, device=device), gls
-    )
-    tok_idx_in_req = (
-        torch.arange(N_total, device=device) - cum[:-1].repeat_interleave(gls)
-    )
-
-    starts_repeats = torch.repeat_interleave(starts, gls)
-    pos = starts_repeats + tok_idx_in_req
-    cache_block_size = k_cache.shape[1]
-    block_in_seq = pos // cache_block_size
-    pos_in_block = pos % cache_block_size
-    phys_block = block_table[req_repeats, block_in_seq].long()
-
-    cache_flat = k_cache.reshape(k_cache.shape[0], -1)
-    block_stride = cache_flat.shape[-1]
-    cache_flat_1d = cache_flat.reshape(-1)
-
-    arange_data = torch.arange(TOKEN_DATA_SIZE, device=device)
-    arange_scale = torch.arange(N_QUANT_BLOCKS, device=device)
-
-    data_base = phys_block * block_stride + pos_in_block * TOKEN_DATA_SIZE
-    data_idx = (data_base.unsqueeze(-1) + arange_data).flatten()
-    data_bytes = cache_flat_1d[data_idx].reshape(N_total, TOKEN_DATA_SIZE)
-
-    scale_base = (
-        phys_block * block_stride
-        + cache_block_size * TOKEN_DATA_SIZE
-        + pos_in_block * TOKEN_SCALE_DIM
-    )
-    scale_idx = (scale_base.unsqueeze(-1) + arange_scale).flatten()
-    scale_bytes = cache_flat_1d[scale_idx].reshape(N_total, N_QUANT_BLOCKS)
-
-    fp8_bytes = data_bytes[:, :TOKEN_FP8_DIM].contiguous()
-    bf16_bytes = data_bytes[
-        :, TOKEN_FP8_DIM : TOKEN_FP8_DIM + TOKEN_BF16_DIM * 2
-    ].contiguous()
-
-    fp8_vals_bf = fp8_bytes.view(torch.float8_e4m3fn).to(torch.bfloat16)
-    bf16_vals = bf16_bytes.view(torch.bfloat16)
-    scales_bf = torch.pow(
-        2.0, scale_bytes.to(torch.float32) - 127.0
-    ).to(torch.bfloat16)
-    fp8_grp = fp8_vals_bf.view(
-        N_total, N_QUANT_BLOCKS, QUANT_BLOCK_SIZE
-    ) * scales_bf.unsqueeze(-1)
-    fp8_dequant = fp8_grp.reshape(N_total, TOKEN_FP8_DIM)
-
-    out_token_idx = offset + tok_idx_in_req
-    out[req_repeats, out_token_idx, :TOKEN_FP8_DIM] = fp8_dequant
-    out[
-        req_repeats, out_token_idx, TOKEN_FP8_DIM : TOKEN_FP8_DIM + TOKEN_BF16_DIM
-    ] = bf16_vals
-
-
 def dequantize_and_gather_k_cache(
     # [num_reqs, max_num_tokens, head_size]
     out: torch.Tensor,
@@ -493,16 +317,6 @@ def dequantize_and_gather_k_cache(
     block_size: int,
     offset: int,
 ) -> None:
-    try:
-        from vllm.utils.deep_gemm import _use_sm86_reference
-        if _use_sm86_reference():
-            return torch.ops.vllm.deepseek_v4_dequant_gather_k_cache_sm86(
-                out, k_cache, seq_lens, gather_lens,
-                block_table, block_size, offset,
-            )
-    except ImportError:
-        pass
-
     TOKEN_FP8_DIM = 448
     TOKEN_BF16_DIM = 64
     TOKEN_SCALE_DIM = 8
@@ -747,70 +561,3 @@ def _combine_topk_swa_indices_kernel(
 
         combined_len = topk_len + swa_len
         tl.store(combined_lens_ptr + token_idx, combined_len)
-
-
-# ─── SM86 opaque-op wrappers ────────────────────────────────────────────────
-# Wrap pyref dispatch as registered torch.library custom ops so PIECEWISE
-# cudagraph capture can split at these boundaries. Bodies invoke .nonzero()
-# / .item() / mutating writes that are forbidden inside cudagraph capture
-# regions. The op names are registered with config.compilation._attention_ops
-# so PIECEWISE auto-splits here.
-try:
-    from vllm.utils.torch_utils import direct_register_custom_op
-
-    def _quant_insert_k_cache_sm86_op(
-        k: torch.Tensor,
-        k_cache: torch.Tensor,
-        slot_mapping: torch.Tensor,
-        block_size: int,
-    ) -> None:
-        _quantize_and_insert_k_cache_pyref(k, k_cache, slot_mapping, block_size)
-
-    def _quant_insert_k_cache_sm86_op_fake(
-        k: torch.Tensor,
-        k_cache: torch.Tensor,
-        slot_mapping: torch.Tensor,
-        block_size: int,
-    ) -> None:
-        return None
-
-    direct_register_custom_op(
-        op_name="deepseek_v4_quant_insert_k_cache_sm86",
-        op_func=_quant_insert_k_cache_sm86_op,
-        mutates_args=["k_cache"],
-        fake_impl=_quant_insert_k_cache_sm86_op_fake,
-    )
-
-    def _dequant_gather_k_cache_sm86_op(
-        out: torch.Tensor,
-        k_cache: torch.Tensor,
-        seq_lens: torch.Tensor,
-        gather_lens: torch.Tensor | None,
-        block_table: torch.Tensor,
-        block_size: int,
-        offset: int,
-    ) -> None:
-        _dequantize_and_gather_k_cache_pyref(
-            out, k_cache, seq_lens, gather_lens,
-            block_table, block_size, offset,
-        )
-
-    def _dequant_gather_k_cache_sm86_op_fake(
-        out: torch.Tensor,
-        k_cache: torch.Tensor,
-        seq_lens: torch.Tensor,
-        gather_lens: torch.Tensor | None,
-        block_table: torch.Tensor,
-        block_size: int,
-        offset: int,
-    ) -> None:
-        return None
-
-    direct_register_custom_op(
-        op_name="deepseek_v4_dequant_gather_k_cache_sm86",
-        op_func=_dequant_gather_k_cache_sm86_op,
-        mutates_args=["out"],
-        fake_impl=_dequant_gather_k_cache_sm86_op_fake,
-    )
-except Exception:
-    pass

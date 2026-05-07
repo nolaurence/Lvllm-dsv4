@@ -12,16 +12,27 @@ if (DEFINED ENV{TRITON_KERNELS_SRC_DIR})
   )
 
 else()
-  set(TRITON_GIT "https://github.com/triton-lang/triton.git")
-  message (STATUS "[triton_kernels] Fetch from ${TRITON_GIT}:${DEFAULT_TRITON_KERNELS_TAG}")
-  FetchContent_Declare(
-          triton_kernels
-          # TODO (varun) : Fetch just the triton_kernels directory from Triton
-          GIT_REPOSITORY https://github.com/triton-lang/triton.git
-          GIT_TAG ${DEFAULT_TRITON_KERNELS_TAG}
-          GIT_PROGRESS TRUE
-          SOURCE_SUBDIR python/triton_kernels/triton_kernels
-  )
+  # Check if existing source already has the expected tag; if so, skip download
+  vllm_use_existing_source_if_commit_matches(NAME triton_kernels EXPECTED_TAG ${DEFAULT_TRITON_KERNELS_TAG})
+  if(triton_kernels_SOURCE_DIR)
+    message (STATUS "[triton_kernels] Using existing source at ${triton_kernels_SOURCE_DIR}")
+    FetchContent_Declare(
+            triton_kernels
+            SOURCE_DIR ${triton_kernels_SOURCE_DIR}
+            SOURCE_SUBDIR python/triton_kernels/triton_kernels
+    )
+  else()
+    set(TRITON_GIT "https://github.com/triton-lang/triton.git")
+    message (STATUS "[triton_kernels] Fetch from ${TRITON_GIT}:${DEFAULT_TRITON_KERNELS_TAG}")
+    FetchContent_Declare(
+            triton_kernels
+            # TODO (varun) : Fetch just the triton_kernels directory from Triton
+            GIT_REPOSITORY https://github.com/triton-lang/triton.git
+            GIT_TAG ${DEFAULT_TRITON_KERNELS_TAG}
+            GIT_PROGRESS TRUE
+            SOURCE_SUBDIR python/triton_kernels/triton_kernels
+    )
+  endif()
 endif()
 
 # Fetch content

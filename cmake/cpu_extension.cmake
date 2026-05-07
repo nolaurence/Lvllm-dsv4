@@ -339,6 +339,7 @@ if (ENABLE_X86_ISA OR (ASIMD_FOUND AND NOT APPLE_SILICON_FOUND) OR POWER9_FOUND 
         PUBLIC ${oneDNN_SOURCE_DIR}/include
         PUBLIC ${oneDNN_BINARY_DIR}/include
         PRIVATE ${oneDNN_SOURCE_DIR}/src
+        PRIVATE ${TORCH_INCLUDE_DIRS}
     )
     target_link_libraries(dnnl_ext dnnl torch)
     target_compile_options(dnnl_ext PRIVATE ${DNNL_COMPILE_FLAGS} -fPIC)

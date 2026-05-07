@@ -191,14 +191,22 @@ else()
     set(USE_ACL OFF)
 endif()
 
+set(ONEDNN_EXPECTED_TAG "v3.9")
+
 if ((AVX512_FOUND AND NOT AVX512_DISABLED) OR (ASIMD_FOUND AND NOT APPLE_SILICON_FOUND) OR POWER9_FOUND OR POWER10_FOUND OR POWER11_FOUND)
-    FetchContent_Declare(
-        oneDNN
-        GIT_REPOSITORY https://github.com/oneapi-src/oneDNN.git
-        GIT_TAG v3.9
-        GIT_PROGRESS TRUE
-        GIT_SHALLOW TRUE
-    )
+    # Check if existing source already has the expected tag; if so, skip download
+    vllm_use_existing_source_if_commit_matches(NAME oneDNN EXPECTED_TAG ${ONEDNN_EXPECTED_TAG})
+    if(oneDNN_SOURCE_DIR)
+      FetchContent_Declare(oneDNN SOURCE_DIR ${oneDNN_SOURCE_DIR})
+    else()
+      FetchContent_Declare(
+          oneDNN
+          GIT_REPOSITORY https://github.com/oneapi-src/oneDNN.git
+          GIT_TAG ${ONEDNN_EXPECTED_TAG}
+          GIT_PROGRESS TRUE
+          GIT_SHALLOW TRUE
+      )
+    endif()
 
     if(USE_ACL)
         find_library(ARM_COMPUTE_LIBRARY NAMES arm_compute PATHS $ENV{ACL_ROOT_DIR}/build/)
@@ -230,6 +238,7 @@ if ((AVX512_FOUND AND NOT AVX512_DISABLED) OR (ASIMD_FOUND AND NOT APPLE_SILICON
         PUBLIC ${oneDNN_SOURCE_DIR}/include
         PUBLIC ${oneDNN_BINARY_DIR}/include
         PRIVATE ${oneDNN_SOURCE_DIR}/src
+        PRIVATE ${TORCH_INCLUDE_DIRS}
     )
     target_link_libraries(dnnl_ext dnnl)
     target_compile_options(dnnl_ext PRIVATE ${CXX_COMPILE_FLAGS} -fPIC)
