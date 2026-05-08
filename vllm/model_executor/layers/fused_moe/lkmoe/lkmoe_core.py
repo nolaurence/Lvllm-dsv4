@@ -14,7 +14,6 @@
 from __future__ import annotations
 
 import gc
-import ctypes
 import threading
 from typing import Optional
 
@@ -25,43 +24,9 @@ from vllm.logger import init_logger
 from vllm.model_executor.layers.fused_moe.unquantized_fused_moe_method import (
     UnquantizedFusedMoEMethod,
 )
-from vllm.utils.platform_utils import is_pin_memory_available
+from vllm.utils import is_pin_memory_available
 
 logger = init_logger(__name__)
-
-
-_GGML_TYPE_TO_TORCH_DTYPE = {
-    0: torch.float32,
-    1: torch.float16,
-    30: torch.bfloat16,
-    # Historical lk_moe callers pass 500 for FP8 weights. Keep the raw bytes in
-    # CPU memory; higher-level code is responsible for dequantization.
-    500: torch.uint8,
-}
-
-
-def _tensor_from_ptr(ptr: int, shape: tuple[int, ...],
-                     dtype: torch.dtype) -> Tensor:
-    if ptr == 0:
-        raise ValueError("Cannot take ownership of a null weight pointer")
-
-    numel = 1
-    for dim in shape:
-        numel *= dim
-
-    element_size = torch.empty((), dtype=dtype).element_size()
-    array_type = ctypes.c_byte * (numel * element_size)
-    array = array_type.from_address(ptr)
-    # frombuffer creates a view of the caller-owned memory, so immediately clone
-    # to make LKMoE own a real CPU allocation.
-    return torch.frombuffer(array, dtype=dtype, count=numel).clone().view(shape).contiguous()
-
-
-def _dtype_from_ggml(ggml_type: int) -> torch.dtype:
-    try:
-        return _GGML_TYPE_TO_TORCH_DTYPE[ggml_type]
-    except KeyError as e:
-        raise ValueError(f"Unsupported lkmoe ggml dtype {ggml_type}") from e
 
 # ---------------------------------------------------------------------------
 # Config wrappers — mirror lk_moe's MOEConfig, MOE_WNA16RepackConfig, etc.
@@ -114,31 +79,6 @@ class LKMoEConfig:
             if buf is not None and buf.device.type == "cpu":
                 buf.pin_memory()
 
-    def take_ownership_of_weights(self, w13: Tensor, w2: Tensor):
-        """
-        Clone weight tensors into internal CPU buffers. After this call,
-        the original tensors can be freed by the caller (clean_weights_after_loading).
-        """
-        # Clone to CPU to take ownership (allows freeing originals)
-        self.w13_weight_cpu = w13.detach().to("cpu", copy=True).contiguous()
-        self.w2_weight_cpu = w2.detach().to("cpu", copy=True).contiguous()
-        self.pin_buffers()
-
-    def take_ownership_of_quantized_weights(
-        self, w13: Tensor, w2: Tensor,
-        w13_scale: Optional[Tensor] = None, w2_scale: Optional[Tensor] = None
-    ):
-        """
-        Clone quantized weights + scales into internal CPU buffers.
-        """
-        self.w13_weight_cpu = w13.detach().to("cpu", copy=True).contiguous()
-        self.w2_weight_cpu = w2.detach().to("cpu", copy=True).contiguous()
-        if w13_scale is not None:
-            self.w13_scale_cpu = w13_scale.detach().to("cpu", copy=True).contiguous()
-        if w2_scale is not None:
-            self.w2_scale_cpu = w2_scale.detach().to("cpu", copy=True).contiguous()
-        self.pin_buffers()
-
     def offload_to_cpu(self):
         for gpu_name, cpu_name in [
             ("w13_weight_gpu", "w13_weight_cpu"),
@@ -160,276 +100,32 @@ class LKMoEConfig:
 
 class MOEConfig(LKMoEConfig):
     """Standard FP16/BF16 MoE — all experts on CPU, on-demand prefetch."""
-
-    def __init__(
-        self,
-        num_processes: int,
-        process_id: int,
-        gpu_id: int,
-        has_gate_proj: bool,
-        expert_num: int,
-        routed_expert_num: int,
-        hidden_size: int,
-        intermediate_size: int,
-        stride: int = 32,
-        group_min_len: int = 10,
-        group_max_len: int = 512,
-        hidden_type: int = 1,
-        w13_type: int | None = None,
-        w2_type: int | None = None,
-        w13_ptr: int | None = None,
-        w2_ptr: int | None = None,
-        **kwargs,
-    ):
-        super().__init__(
-            num_processes,
-            process_id,
-            gpu_id,
-            has_gate_proj,
-            expert_num,
-            routed_expert_num,
-            hidden_size,
-            intermediate_size,
-            stride,
-            group_min_len,
-            group_max_len,
-            hidden_type,
-            **kwargs,
-        )
-        if w13_ptr is not None and w2_ptr is not None:
-            self.w13_weight_cpu = _tensor_from_ptr(
-                w13_ptr,
-                (expert_num, intermediate_size * 2, hidden_size),
-                _dtype_from_ggml(w13_type if w13_type is not None else hidden_type),
-            )
-            self.w2_weight_cpu = _tensor_from_ptr(
-                w2_ptr,
-                (expert_num, hidden_size, intermediate_size),
-                _dtype_from_ggml(w2_type if w2_type is not None else hidden_type),
-            )
-            self.pin_buffers()
+    pass
 
 
 class MOE_WNA16RepackConfig(LKMoEConfig):
     """WNA16 (weight-only int4/8) with on-the-fly dequantization."""
 
-    def __init__(
-        self,
-        num_processes: int,
-        process_id: int,
-        gpu_id: int,
-        has_gate_proj: bool,
-        expert_num: int,
-        routed_expert_num: int,
-        hidden_size: int,
-        intermediate_size: int,
-        stride: int = 32,
-        group_min_len: int = 10,
-        group_max_len: int = 512,
-        hidden_type: int = 1,
-        w13_type: int | None = None,
-        w2_type: int | None = None,
-        w13_ptr: int | None = None,
-        w2_ptr: int | None = None,
-        w13_scale_ptr: int | None = None,
-        w2_scale_ptr: int | None = None,
-        scale_type: int | None = None,
-        groupN: int = 1,
-        groupK: int = -1,
-        packed_factor: int = 8,
-        num_bits: int = 4,
-        group_size: int = 32,
-        **kwargs,
-    ):
-        super().__init__(
-            num_processes,
-            process_id,
-            gpu_id,
-            has_gate_proj,
-            expert_num,
-            routed_expert_num,
-            hidden_size,
-            intermediate_size,
-            stride,
-            group_min_len,
-            group_max_len,
-            hidden_type,
-            **kwargs,
-        )
+    def __init__(self, packed_factor: int = 8, num_bits: int = 4,
+                 group_size: int = 32, **kwargs):
+        super().__init__(**kwargs)
         self.packed_factor = packed_factor
         self.num_bits = num_bits
         self.group_size = group_size
-        self.groupN = groupN
-        self.groupK = groupK
-
-        if w13_ptr is not None and w2_ptr is not None:
-            weights_per_container = max(1, packed_factor // num_bits)
-            self.w13_weight_cpu = _tensor_from_ptr(
-                w13_ptr,
-                (expert_num, intermediate_size * 2, hidden_size // weights_per_container),
-                torch.uint8,
-            )
-            self.w2_weight_cpu = _tensor_from_ptr(
-                w2_ptr,
-                (expert_num, hidden_size, intermediate_size // weights_per_container),
-                torch.uint8,
-            )
-            if w13_scale_ptr is not None and w2_scale_ptr is not None:
-                scale_dtype = _dtype_from_ggml(scale_type if scale_type is not None else 1)
-                self.w13_scale_cpu = _tensor_from_ptr(
-                    w13_scale_ptr,
-                    (expert_num, intermediate_size * 2, hidden_size // group_size),
-                    scale_dtype,
-                )
-                self.w2_scale_cpu = _tensor_from_ptr(
-                    w2_scale_ptr,
-                    (expert_num, hidden_size, intermediate_size // group_size),
-                    scale_dtype,
-                )
-            self.pin_buffers()
 
 
 class MOE_FP8Config(LKMoEConfig):
     """FP8 MoE with block or channel-wise scaling."""
 
-    def __init__(
-        self,
-        num_processes: int,
-        process_id: int,
-        gpu_id: int,
-        has_gate_proj: bool,
-        expert_num: int,
-        routed_expert_num: int,
-        hidden_size: int,
-        intermediate_size: int,
-        stride: int = 32,
-        group_min_len: int = 10,
-        group_max_len: int = 512,
-        hidden_type: int = 1,
-        w13_type: int | None = None,
-        w2_type: int | None = None,
-        w13_ptr: int | None = None,
-        w2_ptr: int | None = None,
-        w13_scale_ptr: int | None = None,
-        w2_scale_ptr: int | None = None,
-        scale_type: int | None = None,
-        groupN: int = 1,
-        groupK: int = -1,
-        **kwargs,
-    ):
-        super().__init__(
-            num_processes,
-            process_id,
-            gpu_id,
-            has_gate_proj,
-            expert_num,
-            routed_expert_num,
-            hidden_size,
-            intermediate_size,
-            stride,
-            group_min_len,
-            group_max_len,
-            hidden_type,
-            **kwargs,
-        )
+    def __init__(self, groupN: int = 1, groupK: int = -1, **kwargs):
+        super().__init__(**kwargs)
         self.groupN = groupN
         self.groupK = groupK
-
-        if w13_ptr is not None and w2_ptr is not None:
-            self.w13_weight_cpu = _tensor_from_ptr(
-                w13_ptr,
-                (expert_num, intermediate_size * 2, hidden_size),
-                _dtype_from_ggml(w13_type if w13_type is not None else 500),
-            )
-            self.w2_weight_cpu = _tensor_from_ptr(
-                w2_ptr,
-                (expert_num, hidden_size, intermediate_size),
-                _dtype_from_ggml(w2_type if w2_type is not None else 500),
-            )
-            if w13_scale_ptr is not None and w2_scale_ptr is not None:
-                scale_dtype = _dtype_from_ggml(scale_type if scale_type is not None else 0)
-                scale_shape = (
-                    (expert_num, (intermediate_size * 2) // groupN, hidden_size // groupK)
-                    if groupK > 0
-                    else (expert_num, intermediate_size * 2, 1)
-                )
-                self.w13_scale_cpu = _tensor_from_ptr(
-                    w13_scale_ptr, scale_shape, scale_dtype
-                )
-                w2_scale_shape = (
-                    (expert_num, hidden_size // groupN, intermediate_size // groupK)
-                    if groupK > 0
-                    else (expert_num, hidden_size, 1)
-                )
-                self.w2_scale_cpu = _tensor_from_ptr(
-                    w2_scale_ptr, w2_scale_shape, scale_dtype
-                )
-            self.pin_buffers()
 
 
 class MOE_QuantConfig(LKMoEConfig):
     """Generic quantized MoE wrapper."""
-
-    def __init__(
-        self,
-        num_processes: int,
-        process_id: int,
-        gpu_id: int,
-        has_gate_proj: bool,
-        expert_num: int,
-        routed_expert_num: int,
-        hidden_size: int,
-        intermediate_size: int,
-        stride: int = 32,
-        group_min_len: int = 10,
-        group_max_len: int = 512,
-        hidden_type: int = 1,
-        w13_weight_data_type: int | None = None,
-        w2_weight_data_type: int | None = None,
-        w13_weight_ptr: int | None = None,
-        w2_weight_ptr: int | None = None,
-        group_size: int = 32,
-        num_bits: int = 4,
-        **kwargs,
-    ):
-        super().__init__(
-            num_processes,
-            process_id,
-            gpu_id,
-            has_gate_proj,
-            expert_num,
-            routed_expert_num,
-            hidden_size,
-            intermediate_size,
-            stride,
-            group_min_len,
-            group_max_len,
-            hidden_type,
-            **kwargs,
-        )
-        self.group_size = group_size
-        self.num_bits = num_bits
-
-        if w13_weight_ptr is not None and w2_weight_ptr is not None:
-            self.w13_weight_cpu = _tensor_from_ptr(
-                w13_weight_ptr,
-                (expert_num, intermediate_size * 2, hidden_size),
-                _dtype_from_ggml(
-                    w13_weight_data_type
-                    if w13_weight_data_type is not None
-                    else hidden_type
-                ),
-            )
-            self.w2_weight_cpu = _tensor_from_ptr(
-                w2_weight_ptr,
-                (expert_num, hidden_size, intermediate_size),
-                _dtype_from_ggml(
-                    w2_weight_data_type
-                    if w2_weight_data_type is not None
-                    else hidden_type
-                ),
-            )
-            self.pin_buffers()
+    pass
 
 
 # ---------------------------------------------------------------------------

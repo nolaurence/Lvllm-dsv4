@@ -96,9 +96,6 @@ def initialize_model(
 def process_weights_after_loading(
     model: nn.Module, model_config: ModelConfig, target_device: torch.device
 ) -> None:
-    from vllm.envs import is_moe_layerwise_load_enabled
-    layerwise = is_moe_layerwise_load_enabled()
-
     for _, module in model.named_modules():
         quant_method = getattr(module, "quant_method", None)
         if isinstance(quant_method, QuantizeMethodBase):
@@ -111,18 +108,6 @@ def process_weights_after_loading(
                 quant_method.process_weights_after_loading(module)
         if isinstance(module, FusedMoE):
             module.process_weights_after_loading()
-            # Per-layer cleanup: free original CPU weight tensors immediately
-            # after lkmoe has taken ownership. This keeps CPU peak at ~1 layer
-            # instead of all layers simultaneously.
-            if layerwise and getattr(module, "use_lk_moe", False):
-                module.clean_weights_after_loading()
-
-    # After all MoE layers are processed, clean up any remaining lkmoe layers
-    # that weren't caught by layerwise cleanup (e.g. when layerwise is disabled).
-    if not layerwise:
-        for _, module in model.named_modules():
-            if isinstance(module, FusedMoE) and getattr(module, "use_lk_moe", False):
-                module.clean_weights_after_loading()
 
     # Initialize post-load attention weights for both Attention and MLA.
     # NOTE: Happens after other modules so we can easily decompress weights.
@@ -143,11 +128,6 @@ def process_weights_after_loading(
 
 @contextmanager
 def device_loading_context(module: torch.nn.Module, target_device: torch.device):
-    # Skip device manipulation for GPU-resident lkmoe layers
-    if isinstance(module, FusedMoE) and getattr(module, "is_gpu_resident_layer", False):
-        yield module
-        return
-
     if target_device.type == "cpu":
         # If target is CPU, no need to move anything
         yield module
