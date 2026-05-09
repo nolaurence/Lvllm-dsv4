@@ -1,7 +1,10 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 
+from __future__ import annotations
+
 from collections.abc import Callable, Iterable
+from abc import abstractmethod
 from enum import Enum
 from typing import Literal, cast, get_args, overload
 
@@ -18,16 +21,13 @@ from vllm.distributed import (
 )
 from vllm.distributed.eplb.eplb_state import EplbLayerState, EplbState
 from vllm.logger import init_logger
-from vllm.model_executor.custom_op import PluggableLayer
+from vllm.model_executor.custom_op import CustomOp, PluggableLayer
 from vllm.model_executor.layers.fused_moe.activation import MoEActivation
 from vllm.model_executor.layers.fused_moe.config import (
     FusedMoEConfig,
     FusedMoEParallelConfig,
     FusedMoEQuantConfig,
     RoutingMethodType,
-)
-from vllm.model_executor.layers.fused_moe.fused_moe_method_base import (
-    FusedMoEMethodBase,
 )
 from vllm.model_executor.layers.fused_moe.fused_moe_modular_method import (
     FusedMoEModularMethod,
@@ -47,13 +47,11 @@ from vllm.model_executor.layers.fused_moe.runner.moe_runner_interface import (
 from vllm.model_executor.layers.fused_moe.runner.shared_experts import (
     SharedExperts,
 )
-from vllm.model_executor.layers.fused_moe.unquantized_fused_moe_method import (
-    UnquantizedFusedMoEMethod,
-)
 from vllm.model_executor.layers.fused_moe.utils import (
     disable_inplace,
 )
 from vllm.model_executor.layers.quantization.base_config import (
+    QuantizeMethodBase,
     QuantizationConfig,
 )
 from vllm.platforms import current_platform

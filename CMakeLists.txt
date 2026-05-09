@@ -1450,6 +1450,7 @@ list(APPEND LLAMAFILE_ARCH_FILES
 add_subdirectory(csrc/lk/bestla)
 
 set(LK_EXT_SRC
+  "csrc/cpu/utils.cpp"
   "csrc/lk/amx_gemm.cpp"
   "csrc/lk/backend_numa.cpp"
   "csrc/lk/moe.cpp"
