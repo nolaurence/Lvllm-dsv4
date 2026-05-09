@@ -32,6 +32,9 @@ from vllm.model_executor.layers.fused_moe.config import (
 from vllm.model_executor.layers.fused_moe.fused_moe_modular_method import (
     FusedMoEModularMethod,
 )
+from vllm.model_executor.layers.fused_moe.fused_moe_method_base import (
+    FusedMoEMethodBase as ModularFusedMoEMethodBase,
+)
 from vllm.model_executor.layers.fused_moe.rocm_aiter_fused_moe import (
     init_aiter_topK_meta_data,
 )
@@ -61,6 +64,7 @@ logger = init_logger(__name__)
 import threading
 import ctypes
 import numpy as np
+import os
 
 import vllm
 from vllm.envs import is_lk_moe_numa_enabled
@@ -108,6 +112,10 @@ if is_lk_moe_numa_enabled():
         return False
 else:
     logger.error("Failed to import vllm._lk_C module or LVLLM_MOE_NUMA_ENABLED is not set to 1, lk::MOE implementation will not be available")
+
+
+def _lvllm_moe_use_int4() -> bool:
+    return os.getenv("LVLLM_MOE_USE_WEIGHT", "INT4").upper() == "INT4"
 
 
 
@@ -1355,7 +1363,9 @@ class FusedMoE(PluggableLayer):
                 quant_method = self.quant_config.get_quant_method(self, prefix)
             if quant_method is None:
                 quant_method = UnquantizedFusedMoEMethod(self.moe_config)
-            assert isinstance(quant_method, FusedMoEMethodBase)
+            assert isinstance(
+                quant_method, (FusedMoEMethodBase, ModularFusedMoEMethodBase)
+            )
             return quant_method
 
         # Note: get_quant_method will look at the layer's local_num_experts
@@ -1447,6 +1457,9 @@ class FusedMoE(PluggableLayer):
     # This is called after all weight loading and post-processing, so it
     # should be safe to swap out the quant_method.
     def maybe_init_modular_kernel(self) -> None:
+        if self.use_lk_moe:
+            return None
+
         # NOTE(rob): WIP refactor. For quant methods that own the MK
         # we create the MK during process_weights_after_loading.
         if self.quant_method.supports_internal_mk or self.quant_method.is_monolithic:
@@ -1472,6 +1485,165 @@ class FusedMoE(PluggableLayer):
                     inplace=not self.moe_config.disable_inplace,
                 )
             )
+
+    def process_weights_after_loading(self) -> None:
+        if self.use_lk_moe and self.lk_moe is None:
+            self._maybe_init_lk_moe()
+        self.maybe_init_modular_kernel()
+
+    def _maybe_init_lk_moe(self) -> None:
+        if not _lvllm_moe_use_int4():
+            return
+        try:
+            from vllm.model_executor.layers.quantization.mxfp4 import (
+                GptOssMxfp4MoEMethod,
+                Mxfp4MoEMethod,
+            )
+
+            if isinstance(self.quant_method, (GptOssMxfp4MoEMethod, Mxfp4MoEMethod)):
+                self._process_mxfp4_weights_to_lk_int4()
+        except Exception as e:
+            self.lk_moe = None
+            self.lk_moe_config = None
+            raise RuntimeError("Failed to initialize MXFP4 lk::MOE") from e
+
+    def _get_processes_info(self) -> tuple[int, int, int]:
+        if self.use_ep:
+            return self.ep_size, self.ep_rank, torch.cuda.current_device()
+        return self.tp_size, self.tp_rank, torch.cuda.current_device()
+
+    def get_ggml_type_from_dtype(self, dtype: torch.dtype) -> int:
+        if dtype == torch.float32:
+            return 0  # GGML_TYPE_F32
+        if dtype == torch.float16:
+            return 1  # GGML_TYPE_F16
+        if dtype == torch.bfloat16:
+            return 30  # GGML_TYPE_BF16
+        raise ValueError(f"Unsupported dtype {dtype}")
+
+    @staticmethod
+    def _dequant_mxfp4_to_bf16(
+        weight: torch.Tensor,
+        scale: torch.Tensor,
+    ) -> torch.Tensor:
+        weight = weight.cpu()
+        scale = scale.cpu()
+        block_size = 32
+        n_dim, k_half = weight.shape
+        k_dim = k_half * 2
+        lut = torch.tensor(
+            [0.0, 0.5, 1.0, 1.5, 2.0, 3.0, 4.0, 6.0,
+             -0.0, -0.5, -1.0, -1.5, -2.0, -3.0, -4.0, -6.0],
+            dtype=torch.bfloat16,
+            device="cpu",
+        )
+        scales = torch.pow(2.0, scale.to(torch.float32) - 127.0)
+        scales = scales.to(torch.bfloat16).repeat_interleave(block_size, dim=-1)
+        if scales.shape[-1] > k_dim:
+            scales = scales[..., :k_dim]
+
+        weight_i32 = weight.to(torch.int32)
+        out = torch.empty(n_dim, k_dim, dtype=torch.bfloat16, device="cpu")
+        out[:, 0::2] = lut[(weight_i32 >> 4) & 0xF]
+        out[:, 1::2] = lut[weight_i32 & 0xF]
+        return out.mul_(scales)
+
+    @staticmethod
+    def _quantize_rows_q4_0(weight: torch.Tensor) -> torch.Tensor:
+        weight = weight.to(torch.float32).contiguous()
+        if weight.shape[-1] % 32 != 0:
+            raise ValueError(
+                f"Q4_0 requires the last dimension to be divisible by 32, "
+                f"got {weight.shape[-1]}"
+            )
+        rows = weight.reshape(-1, weight.shape[-1])
+        blocks = rows.reshape(rows.shape[0], rows.shape[1] // 32, 32)
+        absmax = blocks.abs().amax(dim=-1)
+        scale = (absmax / -8.0).to(torch.float16)
+        scale_f32 = scale.to(torch.float32)
+        safe_scale = torch.where(scale_f32 == 0, torch.ones_like(scale_f32), scale_f32)
+        qs = torch.round(blocks / safe_scale.unsqueeze(-1) + 8.0)
+        qs = torch.clamp(qs, 0, 15).to(torch.uint8)
+        packed = qs[..., 0::2] | (qs[..., 1::2] << 4)
+        block_bytes = torch.empty(
+            (*blocks.shape[:2], 18), dtype=torch.uint8, device="cpu"
+        )
+        block_bytes[..., :2] = scale.view(torch.uint8).reshape(*scale.shape, 2)
+        block_bytes[..., 2:] = packed
+        out_shape = (*weight.shape[:-1], weight.shape[-1] // 32 * 18)
+        return block_bytes.reshape(out_shape).contiguous()
+
+    def _process_mxfp4_weights_to_lk_int4(self) -> None:
+        import vllm._lk_C
+
+        w13_weight = self.w13_weight
+        w2_weight = self.w2_weight
+        w13_scale = self.w13_weight_scale
+        w2_scale = self.w2_weight_scale
+
+        expert_num, total_intermediate, hidden_half = w13_weight.shape
+        intermediate = total_intermediate // 2
+        hidden = hidden_half * 2
+        if w2_weight.shape != (expert_num, hidden, intermediate // 2):
+            raise ValueError(
+                "Unexpected MXFP4 w2 shape for lk::MOE conversion: "
+                f"{tuple(w2_weight.shape)}"
+            )
+
+        gate_q4: list[torch.Tensor] = []
+        up_q4: list[torch.Tensor] = []
+        down_q4: list[torch.Tensor] = []
+        for expert_idx in range(expert_num):
+            w13_bf16 = self._dequant_mxfp4_to_bf16(
+                w13_weight[expert_idx], w13_scale[expert_idx]
+            )
+            w2_bf16 = self._dequant_mxfp4_to_bf16(
+                w2_weight[expert_idx], w2_scale[expert_idx]
+            )
+            gate_q4.append(self._quantize_rows_q4_0(w13_bf16[:intermediate]))
+            up_q4.append(self._quantize_rows_q4_0(w13_bf16[intermediate:]))
+            down_q4.append(self._quantize_rows_q4_0(w2_bf16))
+            del w13_bf16, w2_bf16
+
+        self._lk_gate_q4 = torch.stack(gate_q4, dim=0).contiguous()
+        self._lk_up_q4 = torch.stack(up_q4, dim=0).contiguous()
+        self._lk_down_q4 = torch.stack(down_q4, dim=0).contiguous()
+        gate_q4.clear()
+        up_q4.clear()
+        down_q4.clear()
+
+        hidden_ggml_type = self.get_ggml_type_from_dtype(self.moe_config.in_dtype)
+        q4_0_type = 2  # GGML_TYPE_Q4_0
+        self.lk_moe_config = vllm._lk_C.MOEConfig(
+            self.local_num_experts,
+            self.top_k,
+            self.hidden_size,
+            self.intermediate_size_per_partition,
+            32,
+            10,
+            1024,
+            self._lk_gate_q4.data_ptr(),
+            self._lk_up_q4.data_ptr(),
+            self._lk_down_q4.data_ptr(),
+            q4_0_type,
+            q4_0_type,
+            q4_0_type,
+            hidden_ggml_type,
+        )
+        self.lk_moe = vllm._lk_C.MOE(self.lk_moe_config)
+        for name in ("w13_weight", "w2_weight", "w13_weight_scale", "w2_weight_scale"):
+            if hasattr(self, name):
+                setattr(
+                    self,
+                    name,
+                    torch.nn.Parameter(
+                        torch.empty(0, device="cpu", dtype=torch.uint8),
+                        requires_grad=False,
+                    ),
+                )
+        logger.info(
+            "Initialized MXFP4 lk::MOE INT4 weights for layer %s", self.layer_name
+        )
 
     @property
     def shared_experts(self) -> SharedExperts | None:
@@ -2363,12 +2535,44 @@ class FusedMoE(PluggableLayer):
         self.eplb_state.logical_replica_count = logical_replica_count[moe_layer_idx]
 
     def ensure_moe_quant_config_init(self):
+        if self.lk_moe is not None:
+            return
         if self.quant_method.moe_quant_config is None:
             # Note: the moe_quant_config can't be constructed until after
             # weight loading post processing.
             self.quant_method.moe_quant_config = (
                 self.quant_method.get_fused_moe_quant_config(self)
             )
+
+    def forward_lk(
+        self,
+        hidden_states: torch.Tensor,
+        topk_weights: torch.Tensor,
+        topk_ids: torch.Tensor,
+    ) -> torch.Tensor:
+        if self.lk_moe is None:
+            raise RuntimeError("lk::MOE is not initialized")
+        qlen = hidden_states.shape[0]
+        k = topk_ids.shape[1]
+        input_cpu = hidden_states.detach().to("cpu", non_blocking=True).contiguous()
+        expert_ids_cpu = topk_ids.detach().to(
+            "cpu", dtype=torch.int64, non_blocking=True
+        ).contiguous()
+        weights_cpu = topk_weights.detach().to(
+            "cpu", dtype=torch.float32, non_blocking=True
+        ).contiguous()
+        output_cpu = torch.empty_like(input_cpu)
+        bsz_cpu = torch.tensor([qlen], dtype=torch.int32, device="cpu")
+        self.lk_moe.forward(
+            qlen,
+            k,
+            expert_ids_cpu.data_ptr(),
+            weights_cpu.data_ptr(),
+            input_cpu.data_ptr(),
+            output_cpu.data_ptr(),
+            bsz_cpu.data_ptr(),
+        )
+        return output_cpu.to(hidden_states.device, non_blocking=True)
 
     @property
     def moe_quant_config(self) -> FusedMoEQuantConfig | None:

@@ -39,6 +39,10 @@ from vllm.model_executor.utils import replace_parameter, set_weight_attrs
 logger = init_logger(__name__)
 
 
+def _cpu_offload_enabled(layer: torch.nn.Module) -> bool:
+    return bool(getattr(layer, "use_lk_moe", False))
+
+
 class Mxfp4Config(QuantizationConfig):
     """Canonical base config for MXFP4 quantization.
 
@@ -194,6 +198,7 @@ class GptOssMxfp4MoEMethod(FusedMoEMethodBase):
         layer.num_experts = num_experts
         self.intermediate_size = intermediate_size_per_partition
         self.hidden_size = hidden_size
+        device = torch.device("cpu") if _cpu_offload_enabled(layer) else None
 
         # Fused gate_up_proj (column parallel)
         w13_weight = torch.nn.Parameter(
@@ -202,6 +207,7 @@ class GptOssMxfp4MoEMethod(FusedMoEMethodBase):
                 2 * intermediate_size_per_partition,
                 hidden_size // 2,
                 dtype=weight_dtype,
+                device=device,
             ),
             requires_grad=False,
         )
@@ -214,6 +220,7 @@ class GptOssMxfp4MoEMethod(FusedMoEMethodBase):
                 2 * intermediate_size_per_partition,
                 hidden_size // mxfp4_block,
                 dtype=scale_dtype,
+                device=device,
             ),
             requires_grad=False,
         )
@@ -228,6 +235,7 @@ class GptOssMxfp4MoEMethod(FusedMoEMethodBase):
                 hidden_size,
                 intermediate_size_per_partition // 2,
                 dtype=weight_dtype,
+                device=device,
             ),
             requires_grad=False,
         )
@@ -240,6 +248,7 @@ class GptOssMxfp4MoEMethod(FusedMoEMethodBase):
                 hidden_size,
                 intermediate_size_per_partition // mxfp4_block,
                 dtype=scale_dtype,
+                device=device,
             ),
             requires_grad=False,
         )
@@ -253,6 +262,7 @@ class GptOssMxfp4MoEMethod(FusedMoEMethodBase):
                     num_experts,
                     2 * intermediate_size_per_partition,
                     dtype=torch.bfloat16,
+                    device=device,
                 ),
                 requires_grad=False,
             )
@@ -264,6 +274,7 @@ class GptOssMxfp4MoEMethod(FusedMoEMethodBase):
                     num_experts,
                     hidden_size,
                     dtype=torch.bfloat16,
+                    device=device,
                 ),
                 requires_grad=False,
             )
@@ -369,6 +380,14 @@ class GptOssMxfp4MoEMethod(FusedMoEMethodBase):
             )
 
     def process_weights_after_loading(self, layer):
+        if _cpu_offload_enabled(layer):
+            logger.info_once(
+                "Keeping MXFP4 MoE expert weights on CPU for layerwise offload."
+            )
+            self.moe_quant_config = None
+            self.moe_kernel = None
+            return
+
         w13 = layer.w13_weight
         w2 = layer.w2_weight
         w13_scale = layer.w13_weight_scale
@@ -520,6 +539,7 @@ class Mxfp4MoEMethod(FusedMoEMethodBase):
         layer.num_experts = num_experts
         self.intermediate_size = intermediate_size_per_partition
         self.hidden_size = hidden_size
+        device = torch.device("cpu") if _cpu_offload_enabled(layer) else None
 
         # Fused gate_up_proj (column parallel)
         w13_weight = torch.nn.Parameter(
@@ -528,6 +548,7 @@ class Mxfp4MoEMethod(FusedMoEMethodBase):
                 2 * intermediate_size_per_partition,
                 hidden_size // 2,
                 dtype=weight_dtype,
+                device=device,
             ),
             requires_grad=False,
         )
@@ -540,6 +561,7 @@ class Mxfp4MoEMethod(FusedMoEMethodBase):
                 2 * intermediate_size_per_partition,
                 hidden_size // mxfp4_block,
                 dtype=scale_dtype,
+                device=device,
             ),
             requires_grad=False,
         )
@@ -554,6 +576,7 @@ class Mxfp4MoEMethod(FusedMoEMethodBase):
                 hidden_size,
                 intermediate_size_per_partition // 2,
                 dtype=weight_dtype,
+                device=device,
             ),
             requires_grad=False,
         )
@@ -566,6 +589,7 @@ class Mxfp4MoEMethod(FusedMoEMethodBase):
                 hidden_size,
                 intermediate_size_per_partition // mxfp4_block,
                 dtype=scale_dtype,
+                device=device,
             ),
             requires_grad=False,
         )
@@ -579,6 +603,7 @@ class Mxfp4MoEMethod(FusedMoEMethodBase):
                     num_experts,
                     2 * intermediate_size_per_partition,
                     dtype=torch.bfloat16,
+                    device=device,
                 ),
                 requires_grad=False,
             )
@@ -590,6 +615,7 @@ class Mxfp4MoEMethod(FusedMoEMethodBase):
                     num_experts,
                     hidden_size,
                     dtype=torch.bfloat16,
+                    device=device,
                 ),
                 requires_grad=False,
             )
@@ -695,6 +721,14 @@ class Mxfp4MoEMethod(FusedMoEMethodBase):
             )
 
     def process_weights_after_loading(self, layer):
+        if _cpu_offload_enabled(layer):
+            logger.info_once(
+                "Keeping MXFP4 MoE expert weights on CPU for layerwise offload."
+            )
+            self.moe_quant_config = None
+            self.moe_kernel = None
+            return
+
         w13 = layer.w13_weight
         w2 = layer.w2_weight
         w13_scale = layer.w13_weight_scale

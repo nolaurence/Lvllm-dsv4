@@ -451,6 +451,24 @@ class MoERunner(MoERunnerInterface):
             shared_experts_input, SharedExpertsOrder.NO_OVERLAP
         )
 
+        if getattr(layer, "lk_moe", None) is not None:
+            topk_weights, topk_ids = self.router.select_experts(
+                hidden_states=hidden_states,
+                router_logits=router_logits,
+                input_ids=input_ids,
+            )
+            fused_out = layer.forward_lk(hidden_states, topk_weights, topk_ids)
+            self._maybe_apply_shared_experts(
+                shared_experts_input,
+                SharedExpertsOrder.MULTI_STREAM_OVERLAPPED,
+            )
+            return (
+                self._shared_experts.output
+                if self._shared_experts is not None
+                else None,
+                fused_out,
+            )
+
         if self.quant_method.is_monolithic:
             fused_out = self.quant_method.apply_monolithic(
                 layer=layer,
