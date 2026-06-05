@@ -34,6 +34,9 @@ from vllm.model_executor.layers.quantization.base_config import (
     QuantizeMethodBase,
 )
 from vllm.model_executor.layers.quantization.utils.quant_utils import is_layer_skipped
+from vllm.model_executor.model_loader.reload.layerwise import (
+    initialize_online_processing,
+)
 from vllm.model_executor.utils import replace_parameter, set_weight_attrs
 
 logger = init_logger(__name__)
@@ -41,6 +44,13 @@ logger = init_logger(__name__)
 
 def _cpu_offload_enabled(layer: torch.nn.Module) -> bool:
     return bool(getattr(layer, "use_lk_moe", False))
+
+
+def _mxfp4_weight_device(layer: torch.nn.Module) -> torch.device | None:
+    if not _cpu_offload_enabled(layer):
+        return None
+    layer._vllm_layerwise_restore_device = torch.device("cpu")
+    return torch.device("meta")
 
 
 class Mxfp4Config(QuantizationConfig):
@@ -198,7 +208,9 @@ class GptOssMxfp4MoEMethod(FusedMoEMethodBase):
         layer.num_experts = num_experts
         self.intermediate_size = intermediate_size_per_partition
         self.hidden_size = hidden_size
-        device = torch.device("cpu") if _cpu_offload_enabled(layer) else None
+        device = _mxfp4_weight_device(layer)
+        if _cpu_offload_enabled(layer):
+            self.uses_meta_device = True
 
         # Fused gate_up_proj (column parallel)
         w13_weight = torch.nn.Parameter(
@@ -280,6 +292,9 @@ class GptOssMxfp4MoEMethod(FusedMoEMethodBase):
             )
             layer.register_parameter("w2_bias", w2_bias)
             set_weight_attrs(w2_bias, extra_weight_attrs)
+
+        if _cpu_offload_enabled(layer):
+            initialize_online_processing(layer)
 
     def _setup_kernel(
         self,
@@ -539,7 +554,9 @@ class Mxfp4MoEMethod(FusedMoEMethodBase):
         layer.num_experts = num_experts
         self.intermediate_size = intermediate_size_per_partition
         self.hidden_size = hidden_size
-        device = torch.device("cpu") if _cpu_offload_enabled(layer) else None
+        device = _mxfp4_weight_device(layer)
+        if _cpu_offload_enabled(layer):
+            self.uses_meta_device = True
 
         # Fused gate_up_proj (column parallel)
         w13_weight = torch.nn.Parameter(
@@ -621,6 +638,9 @@ class Mxfp4MoEMethod(FusedMoEMethodBase):
             )
             layer.register_parameter("w2_bias", w2_bias)
             set_weight_attrs(w2_bias, extra_weight_attrs)
+
+        if _cpu_offload_enabled(layer):
+            initialize_online_processing(layer)
 
     def _setup_kernel(
         self,

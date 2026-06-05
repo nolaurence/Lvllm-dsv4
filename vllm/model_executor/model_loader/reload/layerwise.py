@@ -1,6 +1,7 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 import inspect
+import gc
 from collections.abc import Callable
 from functools import wraps
 from weakref import WeakKeyDictionary
@@ -68,7 +69,9 @@ def record_metadata_for_reloading(model: torch.nn.Module):
     for layer in model.modules():
         info = get_layerwise_info(layer)
         info.restore_metadata = capture_layer_to_meta(layer)
-        info.restore_device = torch.get_default_device()
+        info.restore_device = getattr(
+            layer, "_vllm_layerwise_restore_device", torch.get_default_device()
+        )
 
 
 @torch.no_grad()
@@ -314,11 +317,18 @@ def _layerwise_process(layer: torch.nn.Module, info: LayerReloadingInfo):
         param = getattr(layer, name)
         args.arguments["param"] = param
         param.weight_loader(*args.args, **args.kwargs)
+    info.loaded_weights.clear()
+    gc.collect()
 
     # Process weights (quantization, repacking, etc.)
-    quant_method = getattr(layer, "quant_method", None)
-    if isinstance(quant_method, QuantizeMethodBase):
-        quant_method.process_weights_after_loading(layer)
+    if getattr(layer, "use_lk_moe", False) and hasattr(
+        layer, "process_weights_after_loading"
+    ):
+        layer.process_weights_after_loading()
+    else:
+        quant_method = getattr(layer, "quant_method", None)
+        if isinstance(quant_method, QuantizeMethodBase):
+            quant_method.process_weights_after_loading(layer)
 
     # Copy processed values into original tensor storage (preserves cudagraph refs)
     # this code is a no-op if not reloading (because kernel tensors is empty)

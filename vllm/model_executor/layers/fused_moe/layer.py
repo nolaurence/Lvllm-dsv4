@@ -65,9 +65,11 @@ import threading
 import ctypes
 import numpy as np
 import os
+import gc
 
 import vllm
 from vllm.envs import is_lk_moe_numa_enabled
+from vllm.model_executor.utils import replace_parameter
 from vllm.model_executor.layers.fused_moe.lkmoe import (
     LKMoE, MOE, MOE_WNA16Repack, MOE_FP8, MOE_Quant,
     MOEConfig, MOE_WNA16RepackConfig, MOE_FP8Config, MOE_QuantConfig,
@@ -1656,17 +1658,14 @@ class FusedMoE(PluggableLayer):
             hidden_ggml_type,
         )
         self.lk_moe = vllm._lk_C.MOE(self.lk_moe_config)
+        empty_weight = torch.empty(0, device="cpu", dtype=torch.uint8)
         for name in ("w13_weight", "w2_weight", "w13_weight_scale", "w2_weight_scale"):
-            if hasattr(self, name):
-                setattr(
-                    self,
-                    name,
-                    torch.nn.Parameter(
-                        torch.empty(0, device="cpu", dtype=torch.uint8),
-                        requires_grad=False,
-                    ),
-                )
-        logger.info(
+            replace_parameter(self, name, empty_weight)
+        del w13_weight, w2_weight, w13_scale, w2_scale
+        gc.collect()
+        if convert_device.type == "cuda":
+            torch.cuda.empty_cache()
+        logger.debug(
             "Initialized MXFP4 lk::MOE INT4 weights for layer %s", self.layer_name
         )
 
