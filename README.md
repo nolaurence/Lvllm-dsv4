@@ -36,7 +36,7 @@ Lvllm使用最新的vLLM源码，重新设计实现了MOE模型混合推理模�
  
 ```bash
 2026-04-06: lvllm-v2.1.0 - 增强使用LK_POWER_SAVING=1节能效果，支持FP8+BF16+AWQ4bit的混合MOE层推理
-2026-03-22: lvllm-v2.0.0 - FP8 MoE模型使用INT4专家量化时支持逐层加载，减少峰值内存占用，LVLLM_ENABLE_MOE_LAYERWISEISE_LOAD=1
+2026-03-22: lvllm-v2.0.0 - FP8 MoE模型使用INT4专家量化时支持逐层加载，减少峰值内存占用，LVLLM_ENABLE_MOE_LAYERWISE_LOAD=1
 2026-03-19: lvllm-v1.9.10 - 修复已知问题，支持新的moe模型类型[没有gate_proj], 例如：NVIDIA-Nemotron-3-Super-120B-A12B-BF16
 2026-03-11: lvllm-v1.9.2 - FP8、AWQ4bit模型开启GPU Prefill加速不再占用额外内存, FP8模型取消TO_DTYPE运行时类型转换、KEEP暂不支持开启GPU Prefill
 2026-03-05: lvllm-v1.9.0 - 优化GPU预填充和常规预填充，确保输出质量
@@ -136,7 +136,7 @@ LVLLM_GPU_PREFETCH_WINDOW=1 \
 LVLLM_GPU_PREFILL_MIN_BATCH_SIZE=2048 \
 LVLLM_ENABLE_NUMA_INTERLEAVE=1 \
 LVLLM_MOE_QUANT_ON_GPU=1 \
-LVLLM_ENABLE_MOE_LAYERWISEISE_LOAD=1 \
+LVLLM_ENABLE_MOE_LAYERWISE_LOAD=1 \
 vllm serve \
     --model /home/guqiong/Models/Qwen3.6-35B-A3B \
     --host 0.0.0.0 \
@@ -269,7 +269,7 @@ LVLLM_GPU_PREFETCH_WINDOW=1 \
 LVLLM_GPU_PREFILL_MIN_BATCH_SIZE=2048 \
 LVLLM_ENABLE_NUMA_INTERLEAVE=1 \
 LVLLM_MOE_QUANT_ON_GPU=1 \
-LVLLM_ENABLE_MOE_LAYERWISEISE_LOAD=1 \
+LVLLM_ENABLE_MOE_LAYERWISE_LOAD=1 \
 vllm serve \
     --model /home/guqiong/Models/Qwen3.5-122B-A10B \
     --host 0.0.0.0 \
@@ -316,7 +316,7 @@ LVLLM_GPU_PREFETCH_WINDOW=1 \
 LVLLM_GPU_PREFILL_MIN_BATCH_SIZE=2048 \
 LVLLM_ENABLE_NUMA_INTERLEAVE=1 \
 LVLLM_MOE_QUANT_ON_GPU=1 \
-LVLLM_ENABLE_MOE_LAYERWISEISE_LOAD=1 \
+LVLLM_ENABLE_MOE_LAYERWISE_LOAD=1 \
 vllm serve \
     --model /home/guqiong/Models/Qwen3.5-397B-A17B-FP8 \
     --host 0.0.0.0 \
@@ -704,7 +704,7 @@ LVLLM_MOE_USE_WEIGHT=INT4
 # 慢速加载模型可避免OOM，建议值：加载模型文件时，内存充裕使用`0`，内存紧张使用`1`
 LVLLM_ENABLE_NUMA_INTERLEAVE=1 
 # FP8 MoE模型逐层加载，减少峰值内存占用
-LVLLM_ENABLE_MOE_LAYERWISEISE_LOAD=1
+LVLLM_ENABLE_MOE_LAYERWISE_LOAD=1
 ```
 
 ### 模型加载专家量化
