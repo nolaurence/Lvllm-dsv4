@@ -1525,9 +1525,12 @@ class FusedMoE(PluggableLayer):
     def _dequant_mxfp4_to_bf16(
         weight: torch.Tensor,
         scale: torch.Tensor,
+        device: torch.device | None = None,
     ) -> torch.Tensor:
-        weight = weight.cpu()
-        scale = scale.cpu()
+        if device is None:
+            device = weight.device
+        weight = weight.to(device, non_blocking=True)
+        scale = scale.to(device, non_blocking=True)
         block_size = 32
         n_dim, k_half = weight.shape
         k_dim = k_half * 2
@@ -1535,7 +1538,7 @@ class FusedMoE(PluggableLayer):
             [0.0, 0.5, 1.0, 1.5, 2.0, 3.0, 4.0, 6.0,
              -0.0, -0.5, -1.0, -1.5, -2.0, -3.0, -4.0, -6.0],
             dtype=torch.bfloat16,
-            device="cpu",
+            device=device,
         )
         scales = torch.pow(2.0, scale.to(torch.float32) - 127.0)
         scales = scales.to(torch.bfloat16).repeat_interleave(block_size, dim=-1)
@@ -1543,7 +1546,7 @@ class FusedMoE(PluggableLayer):
             scales = scales[..., :k_dim]
 
         weight_i32 = weight.to(torch.int32)
-        out = torch.empty(n_dim, k_dim, dtype=torch.bfloat16, device="cpu")
+        out = torch.empty(n_dim, k_dim, dtype=torch.bfloat16, device=device)
         out[:, 0::2] = lut[(weight_i32 >> 4) & 0xF]
         out[:, 1::2] = lut[weight_i32 & 0xF]
         return out.mul_(scales)
@@ -1565,9 +1568,9 @@ class FusedMoE(PluggableLayer):
         qs = torch.round(blocks / safe_scale.unsqueeze(-1) + 8.0)
         qs = torch.clamp(qs, 0, 15).to(torch.uint8)
         packed = qs[..., 0::2] | (qs[..., 1::2] << 4)
-        block_bytes = torch.empty(
-            (*blocks.shape[:2], 18), dtype=torch.uint8, device="cpu"
-        )
+        block_bytes = torch.empty((*blocks.shape[:2], 18),
+                                  dtype=torch.uint8,
+                                  device=weight.device)
         block_bytes[..., :2] = scale.view(torch.uint8).reshape(*scale.shape, 2)
         block_bytes[..., 2:] = packed
         out_shape = (*weight.shape[:-1], weight.shape[-1] // 32 * 18)
@@ -1590,27 +1593,49 @@ class FusedMoE(PluggableLayer):
                 f"{tuple(w2_weight.shape)}"
             )
 
-        gate_q4: list[torch.Tensor] = []
-        up_q4: list[torch.Tensor] = []
-        down_q4: list[torch.Tensor] = []
+        convert_device = (
+            torch.device("cuda", torch.cuda.current_device())
+            if torch.cuda.is_available()
+            else torch.device("cpu")
+        )
+        gate_q4_shape = (expert_num, intermediate, hidden // 32 * 18)
+        up_q4_shape = gate_q4_shape
+        down_q4_shape = (expert_num, hidden, intermediate // 32 * 18)
+        self._lk_gate_q4 = torch.empty(gate_q4_shape,
+                                       dtype=torch.uint8,
+                                       device="cpu")
+        self._lk_up_q4 = torch.empty(up_q4_shape,
+                                     dtype=torch.uint8,
+                                     device="cpu")
+        self._lk_down_q4 = torch.empty(down_q4_shape,
+                                       dtype=torch.uint8,
+                                       device="cpu")
         for expert_idx in range(expert_num):
             w13_bf16 = self._dequant_mxfp4_to_bf16(
-                w13_weight[expert_idx], w13_scale[expert_idx]
+                w13_weight[expert_idx],
+                w13_scale[expert_idx],
+                convert_device,
             )
-            w2_bf16 = self._dequant_mxfp4_to_bf16(
-                w2_weight[expert_idx], w2_scale[expert_idx]
-            )
-            gate_q4.append(self._quantize_rows_q4_0(w13_bf16[:intermediate]))
-            up_q4.append(self._quantize_rows_q4_0(w13_bf16[intermediate:]))
-            down_q4.append(self._quantize_rows_q4_0(w2_bf16))
-            del w13_bf16, w2_bf16
+            gate_q4 = self._quantize_rows_q4_0(w13_bf16[:intermediate])
+            self._lk_gate_q4[expert_idx].copy_(
+                gate_q4, non_blocking=False)
+            del gate_q4
+            up_q4 = self._quantize_rows_q4_0(w13_bf16[intermediate:])
+            self._lk_up_q4[expert_idx].copy_(up_q4, non_blocking=False)
+            del up_q4, w13_bf16
 
-        self._lk_gate_q4 = torch.stack(gate_q4, dim=0).contiguous()
-        self._lk_up_q4 = torch.stack(up_q4, dim=0).contiguous()
-        self._lk_down_q4 = torch.stack(down_q4, dim=0).contiguous()
-        gate_q4.clear()
-        up_q4.clear()
-        down_q4.clear()
+            w2_bf16 = self._dequant_mxfp4_to_bf16(
+                w2_weight[expert_idx],
+                w2_scale[expert_idx],
+                convert_device,
+            )
+            down_q4 = self._quantize_rows_q4_0(w2_bf16)
+            self._lk_down_q4[expert_idx].copy_(down_q4, non_blocking=False)
+            del down_q4, w2_bf16
+
+        self._lk_gate_q4 = self._lk_gate_q4.contiguous()
+        self._lk_up_q4 = self._lk_up_q4.contiguous()
+        self._lk_down_q4 = self._lk_down_q4.contiguous()
 
         hidden_ggml_type = self.get_ggml_type_from_dtype(self.moe_config.in_dtype)
         q4_0_type = 2  # GGML_TYPE_Q4_0
