@@ -88,6 +88,14 @@ lk_moe.MOE_QuantConfig = MOE_QuantConfig
 lk_moe.LKMoEConfig = LKMoEConfig
 lk_moe.LKMoeSerialGuard = LKMoeSerialGuard
 
+
+def _malloc_trim() -> None:
+    try:
+        ctypes.CDLL(None).malloc_trim(0)
+    except Exception:
+        pass
+
+
 if is_lk_moe_numa_enabled():
     GGML_TYPE_TO_TORCH_DTYPE = {
         0: torch.float32,    # GGML_TYPE_F32
@@ -1658,11 +1666,13 @@ class FusedMoE(PluggableLayer):
             hidden_ggml_type,
         )
         self.lk_moe = vllm._lk_C.MOE(self.lk_moe_config)
+        del self._lk_gate_q4, self._lk_up_q4, self._lk_down_q4
         empty_weight = torch.empty(0, device="cpu", dtype=torch.uint8)
         for name in ("w13_weight", "w2_weight", "w13_weight_scale", "w2_weight_scale"):
             replace_parameter(self, name, empty_weight)
         del w13_weight, w2_weight, w13_scale, w2_scale
         gc.collect()
+        _malloc_trim()
         if convert_device.type == "cuda":
             torch.cuda.empty_cache()
         logger.debug(

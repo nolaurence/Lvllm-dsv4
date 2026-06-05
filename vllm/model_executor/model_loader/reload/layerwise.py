@@ -2,6 +2,8 @@
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 import inspect
 import gc
+import os
+import ctypes
 from collections.abc import Callable
 from functools import wraps
 from weakref import WeakKeyDictionary
@@ -43,6 +45,39 @@ __all__ = [
 LAYERWISE_INFO: WeakKeyDictionary[torch.nn.Module, LayerReloadingInfo] = (
     WeakKeyDictionary()
 )
+
+
+def _is_lk_moe_layer(layer: torch.nn.Module) -> bool:
+    return bool(getattr(layer, "use_lk_moe", False))
+
+
+def _layer_label(layer: torch.nn.Module) -> str:
+    return getattr(layer, "layer_name", layer.__class__.__name__)
+
+
+def _loaded_weight_bytes(info: LayerReloadingInfo) -> int:
+    total = 0
+    for _, args in info.loaded_weights:
+        loaded_weight = args.arguments.get("loaded_weight")
+        if isinstance(loaded_weight, torch.Tensor):
+            total += loaded_weight.numel() * loaded_weight.element_size()
+    return total
+
+
+def _rss_gib() -> float:
+    try:
+        with open("/proc/self/statm") as f:
+            rss_pages = int(f.read().split()[1])
+        return rss_pages * os.sysconf("SC_PAGE_SIZE") / (1024**3)
+    except Exception:
+        return -1.0
+
+
+def _malloc_trim() -> None:
+    try:
+        ctypes.CDLL(None).malloc_trim(0)
+    except Exception:
+        pass
 
 
 def get_layerwise_info(layer: torch.nn.Module) -> LayerReloadingInfo:
@@ -125,6 +160,14 @@ def initialize_online_processing(layer: torch.nn.Module):
     info.load_numel = 0
     info.load_numel_total = get_layer_size(layer)
 
+    if _is_lk_moe_layer(layer):
+        logger.debug(
+            "lk::MOE layerwise init %s total_numel=%s rss=%.2fGiB",
+            _layer_label(layer),
+            info.load_numel_total,
+            _rss_gib(),
+        )
+
     # Wrap each parameter's weight loader
     # Note that nested wrapping will occur for shared tensors
     for name, tensor in get_layer_tensors(layer).items():
@@ -169,6 +212,23 @@ def make_online_process_loader(layer: torch.nn.Module, param_name: str) -> Calla
         info.loaded_weights.append((param_name, bound_args))
         num_loaded, ret = get_numel_loaded(original_loader, bound_args)
         info.load_numel += num_loaded
+
+        if _is_lk_moe_layer(layer) and (
+            len(info.loaded_weights) <= 4
+            or info.load_numel >= info.load_numel_total
+            or len(info.loaded_weights) % 128 == 0
+        ):
+            logger.debug(
+                "lk::MOE layerwise load %s param=%s cached=%d "
+                "cached_weight=%.2fGiB loaded=%d/%d rss=%.2fGiB",
+                _layer_label(layer),
+                param_name,
+                len(info.loaded_weights),
+                _loaded_weight_bytes(info) / (1024**3),
+                info.load_numel,
+                info.load_numel_total,
+                _rss_gib(),
+            )
 
         logger.debug(
             "%s: %d / %d",
@@ -300,6 +360,18 @@ def _layerwise_process(layer: torch.nn.Module, info: LayerReloadingInfo):
     3. Runs quantization processing if applicable
     4. Copies processed values back to original tensor storage
     """
+    if _is_lk_moe_layer(layer):
+        logger.debug(
+            "lk::MOE layerwise process start %s cached=%d "
+            "cached_weight=%.2fGiB loaded=%d/%d rss=%.2fGiB",
+            _layer_label(layer),
+            len(info.loaded_weights),
+            _loaded_weight_bytes(info) / (1024**3),
+            info.load_numel,
+            info.load_numel_total,
+            _rss_gib(),
+        )
+
     # Materialize layer tensors onto device
     materialize_layer(layer, info)
 
@@ -319,6 +391,7 @@ def _layerwise_process(layer: torch.nn.Module, info: LayerReloadingInfo):
         param.weight_loader(*args.args, **args.kwargs)
     info.loaded_weights.clear()
     gc.collect()
+    _malloc_trim()
 
     # Process weights (quantization, repacking, etc.)
     if getattr(layer, "use_lk_moe", False) and hasattr(
@@ -336,6 +409,12 @@ def _layerwise_process(layer: torch.nn.Module, info: LayerReloadingInfo):
         _copy_and_restore_kernel_tensors(layer, info)
 
     info.reset()
+    if _is_lk_moe_layer(layer):
+        logger.debug(
+            "lk::MOE layerwise process done %s rss=%.2fGiB",
+            _layer_label(layer),
+            _rss_gib(),
+        )
     logger.debug("%s: Processed", layer.__class__.__name__)
 
 
