@@ -2590,12 +2590,17 @@ class FusedMoE(PluggableLayer):
         k = topk_ids.shape[1]
         input_cpu = hidden_states.detach().to("cpu", non_blocking=True).contiguous()
         expert_ids_cpu = topk_ids.detach().to(
-            "cpu", dtype=torch.int64, non_blocking=True
+            "cpu", dtype=torch.uint64, non_blocking=True
         ).contiguous()
         weights_cpu = topk_weights.detach().to(
             "cpu", dtype=torch.float32, non_blocking=True
         ).contiguous()
-        output_cpu = torch.empty_like(input_cpu)
+        output_cpu = torch.empty(
+            input_cpu.shape,
+            dtype=input_cpu.dtype,
+            device="cpu",
+            pin_memory=True,
+        ).contiguous()
         bsz_cpu = torch.tensor([qlen], dtype=torch.int32, device="cpu")
         self.lk_moe.forward(
             qlen,

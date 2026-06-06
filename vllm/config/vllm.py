@@ -1084,6 +1084,20 @@ class VllmConfig:
                     )
                     self.compilation_config.cudagraph_mode = CUDAGraphMode.PIECEWISE
 
+            if (
+                os.getenv("LVLLM_MOE_NUMA_ENABLED") == "1"
+                and os.getenv("LVLLM_ENABLE_MOE_LAYERWISE_LOAD") == "1"
+                and self.compilation_config.cudagraph_mode != CUDAGraphMode.NONE
+            ):
+                logger.warning_once(
+                    "lk::MOE CPU layerwise offload is enabled, which executes "
+                    "CPU MoE work and host-to-device copies in decode. CUDA "
+                    "graphs cannot safely capture this path. Overriding "
+                    "cudagraph_mode from %s to NONE.",
+                    self.compilation_config.cudagraph_mode.name,
+                )
+                self.compilation_config.cudagraph_mode = CUDAGraphMode.NONE
+
             # disable cudagraph when enforce eager execution
             if self.model_config is not None and self.model_config.enforce_eager:
                 logger.info("Cudagraph is disabled under eager mode")

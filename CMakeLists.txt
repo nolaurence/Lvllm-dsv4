@@ -1485,6 +1485,13 @@ if(VLLM_GPU_LANG STREQUAL "CUDA")
 endif()
 
 target_include_directories(_lk_C PRIVATE ${llama_cpp_SOURCE_DIR} )
+target_include_directories(_lk_C PRIVATE ${TORCH_INCLUDE_DIRS})
+if (USE_ONEDNN)
+  target_include_directories(_lk_C PRIVATE
+    ${VLLM_ONEDNN_SOURCE_DIR}/include
+    ${VLLM_ONEDNN_BINARY_DIR}/include
+    ${VLLM_ONEDNN_SOURCE_DIR}/src)
+endif()
  
 if(CMAKE_BUILD_TYPE STREQUAL "Debug")
   # Use minimal optimization and enable debug info for better debugging experience
@@ -1503,7 +1510,7 @@ else()
 endif()
 
 if (USE_ONEDNN)
-  target_link_libraries(_lk_C PRIVATE dnnl_ext llama neural_speed::bestla)
+  target_link_libraries(_lk_C PRIVATE dnnl_ext torch llama neural_speed::bestla)
 endif() 
 target_link_libraries(_lk_C PRIVATE llama neural_speed::bestla)
  

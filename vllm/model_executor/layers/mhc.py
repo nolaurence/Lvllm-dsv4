@@ -628,6 +628,29 @@ def hc_head_fuse_tilelang(
         T.pdl_trigger()
 
 
+def _hc_head_fused_pyref(
+    hs_flat: torch.Tensor,
+    fn: torch.Tensor,
+    hc_scale: torch.Tensor,
+    hc_base: torch.Tensor,
+    out: torch.Tensor,
+    hidden_size: int,
+    rms_eps: float,
+    hc_eps: float,
+    hc_mult: int,
+) -> None:
+    hs_f32 = hs_flat.float()
+    hs_view = hs_f32.view(-1, hc_mult * hidden_size)
+    sqrsum = (hs_view * hs_view).sum(dim=-1)
+    rms = torch.rsqrt(sqrsum / (hc_mult * hidden_size) + rms_eps)
+    mixes = torch.matmul(hs_view, fn.t())
+    pre_mix = (
+        torch.sigmoid(mixes * rms.unsqueeze(-1) * hc_scale[0] + hc_base)
+        + hc_eps
+    )
+    out.copy_((pre_mix.unsqueeze(-1) * hs_f32).sum(dim=1).to(torch.bfloat16))
+
+
 def _hc_head_fused_kernel(
     hs_flat: torch.Tensor,
     fn: torch.Tensor,
@@ -640,6 +663,21 @@ def _hc_head_fused_kernel(
     hc_mult: int,
 ) -> None:
     if hs_flat.shape[0] > 0:
+        from vllm.utils.deep_gemm import _use_sm86_reference
+
+        if _use_sm86_reference():
+            _hc_head_fused_pyref(
+                hs_flat,
+                fn,
+                hc_scale,
+                hc_base,
+                out,
+                hidden_size,
+                rms_eps,
+                hc_eps,
+                hc_mult,
+            )
+            return
         hc_head_fuse_tilelang(
             hs_flat,
             fn,

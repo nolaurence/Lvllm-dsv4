@@ -575,6 +575,19 @@ class Worker(WorkerBase):
                 if not any(x in compile_range for x in all_sizes):
                     warmup_sizes.append(compile_range.end)
 
+        if (
+            os.getenv("LVLLM_MOE_NUMA_ENABLED") == "1"
+            and os.getenv("LVLLM_ENABLE_MOE_LAYERWISE_LOAD") == "1"
+            and warmup_sizes
+        ):
+            logger.warning(
+                "Skipping compile-range warmup sizes %s because lk::MOE CPU "
+                "layerwise offload would run large dummy MoE batches on CPU "
+                "during startup.",
+                sorted(warmup_sizes, reverse=True),
+            )
+            warmup_sizes = []
+
         # We skip EPLB here since we don't want to record dummy metrics
         for size in sorted(warmup_sizes, reverse=True):
             logger.info("Compile and warming up model for size %d", size)
@@ -692,8 +705,10 @@ class Worker(WorkerBase):
         set_random_seed(self.model_config.seed)
 
         return CompilationTimes(
-            language_model=self.compilation_config.compilation_time,
-            encoder=self.compilation_config.encoder_compilation_time,
+            language_model=getattr(self.compilation_config,
+                                   "compilation_time", 0.0),
+            encoder=getattr(self.compilation_config,
+                            "encoder_compilation_time", 0.0),
         )
 
     def reset_mm_cache(self) -> None:

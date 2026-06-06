@@ -232,15 +232,29 @@ if ((AVX512_FOUND AND NOT AVX512_DISABLED) OR (ASIMD_FOUND AND NOT APPLE_SILICON
     set(CMAKE_POLICY_DEFAULT_CMP0077 NEW)
 
     FetchContent_MakeAvailable(oneDNN)
+    set(VLLM_ONEDNN_SOURCE_DIR "${oneDNN_SOURCE_DIR}")
+    set(VLLM_ONEDNN_BINARY_DIR "${oneDNN_BINARY_DIR}")
+    if(NOT VLLM_ONEDNN_SOURCE_DIR)
+        set(VLLM_ONEDNN_SOURCE_DIR "${onednn_SOURCE_DIR}")
+    endif()
+    if(NOT VLLM_ONEDNN_BINARY_DIR)
+        set(VLLM_ONEDNN_BINARY_DIR "${onednn_BINARY_DIR}")
+    endif()
+    if(NOT VLLM_ONEDNN_SOURCE_DIR)
+        set(VLLM_ONEDNN_SOURCE_DIR "${CMAKE_SOURCE_DIR}/.deps/onednn-src")
+    endif()
+    if(NOT VLLM_ONEDNN_BINARY_DIR)
+        set(VLLM_ONEDNN_BINARY_DIR "${CMAKE_SOURCE_DIR}/.deps/onednn-build")
+    endif()
     add_library(dnnl_ext OBJECT "csrc/cpu/dnnl_helper.cpp")
     target_include_directories(
         dnnl_ext
-        PUBLIC ${oneDNN_SOURCE_DIR}/include
-        PUBLIC ${oneDNN_BINARY_DIR}/include
-        PRIVATE ${oneDNN_SOURCE_DIR}/src
+        PUBLIC ${VLLM_ONEDNN_SOURCE_DIR}/include
+        PUBLIC ${VLLM_ONEDNN_BINARY_DIR}/include
+        PRIVATE ${VLLM_ONEDNN_SOURCE_DIR}/src
         PRIVATE ${TORCH_INCLUDE_DIRS}
     )
-    target_link_libraries(dnnl_ext dnnl)
+    target_link_libraries(dnnl_ext dnnl torch)
     target_compile_options(dnnl_ext PRIVATE ${CXX_COMPILE_FLAGS} -fPIC)
     list(APPEND LIBS dnnl_ext)
     set(USE_ONEDNN ON)
@@ -294,4 +308,3 @@ if(USE_ONEDNN)
 endif()
 
 message(STATUS "CPU extension source files: ${VLLM_EXT_SRC}")
-

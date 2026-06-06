@@ -638,6 +638,69 @@ def _fp8_paged_mqa_logits_pyref(
     return logits
 
 
+def _fp8_paged_mqa_logits_capture_safe(
+    q_values: torch.Tensor,
+    kv_cache: torch.Tensor,
+    weights: torch.Tensor,
+    context_lens: torch.Tensor,
+    block_tables: torch.Tensor,
+    max_model_len: int,
+    clean_logits: bool,
+) -> torch.Tensor:
+    """Fixed-shape SM86 FP8 paged MQA fallback for CUDA graph capture."""
+    B, next_n, H, D = q_values.shape
+    M = B * next_n
+    block_size = kv_cache.shape[1]
+    cache_dim = kv_cache.shape[-1]
+    assert cache_dim == D + 4, (
+        f"kv_cache last dim {cache_dim} != D+4 ({D+4}); layout mismatch"
+    )
+
+    fill = float("-inf") if clean_logits else 0.0
+    logits = torch.full(
+        (M, max_model_len), fill, dtype=torch.float32, device=q_values.device
+    )
+    q_bf = q_values.to(torch.bfloat16).reshape(M, H, D)
+
+    if context_lens.dim() == 2:
+        ctx_per_batch = context_lens.amax(dim=-1)
+    else:
+        ctx_per_batch = context_lens
+
+    max_blocks = min(block_tables.shape[1],
+                     (max_model_len + block_size - 1) // block_size)
+    total_tokens = min(max_model_len, max_blocks * block_size)
+    token_idx = torch.arange(total_tokens, device=q_values.device)
+
+    for b in range(B):
+        bt = block_tables[b, :max_blocks].to(torch.long)
+        rows = kv_cache[bt].reshape(max_blocks * block_size,
+                                    cache_dim)[:total_tokens]
+        rows = rows.contiguous()
+        k_bytes = rows[:, :D].contiguous()
+        scale_bytes = rows[:, D : D + 4].contiguous()
+        scales = scale_bytes.view(torch.float32).squeeze(-1).to(torch.bfloat16)
+        k_fp8 = k_bytes.view(torch.float8_e4m3fn)
+        k_bf = k_fp8.to(torch.bfloat16) * scales.unsqueeze(-1)
+
+        m_start = b * next_n
+        m_end = m_start + next_n
+        scores = torch.einsum("mhd,nd->mhn", q_bf[m_start:m_end], k_bf)
+        weighted = (
+            weights[m_start:m_end].to(torch.float32).unsqueeze(-1)
+            * scores.to(torch.float32)
+        ).sum(dim=1)
+
+        valid = token_idx < ctx_per_batch[b]
+        if clean_logits:
+            weighted = torch.where(valid.unsqueeze(0), weighted, fill)
+        else:
+            weighted = weighted * valid.to(weighted.dtype).unsqueeze(0)
+        logits[m_start:m_end, :total_tokens] = weighted
+
+    return logits
+
+
 def fp8_fp4_paged_mqa_logits(
     q: tuple[torch.Tensor, torch.Tensor | None],
     kv_cache: torch.Tensor,
@@ -682,6 +745,11 @@ def fp8_fp4_paged_mqa_logits(
             raise NotImplementedError(
                 "SM86 reference: FP4 paged MQA path not implemented. "
                 "Disable use_fp4_indexer_cache or run on SM>=90."
+            )
+        if torch.cuda.is_current_stream_capturing():
+            return _fp8_paged_mqa_logits_capture_safe(
+                q_values, kv_cache, weights, context_lens,
+                block_tables, max_model_len, clean_logits,
             )
         return _fp8_paged_mqa_logits_pyref(
             q_values, kv_cache, weights, context_lens,

@@ -48,6 +48,7 @@ from vllm.model_executor.layers.quantization.utils.fp8_utils import (
     create_fp8_input_scale,
     create_fp8_scale_parameter,
     create_fp8_weight_parameter,
+    deepgemm_post_process_fp8_weight_block,
     process_fp8_input_tensor_strategy_moe,
     process_fp8_weight_tensor_strategy,
     process_fp8_weight_tensor_strategy_moe,
@@ -82,6 +83,7 @@ from vllm.model_executor.parameter import (
 from vllm.model_executor.utils import replace_parameter, set_weight_attrs
 from vllm.platforms import current_platform
 from vllm.utils.deep_gemm import (
+    is_deep_gemm_e8m0_used,
     is_deep_gemm_supported,
 )
 
@@ -386,6 +388,22 @@ class Fp8LinearMethod(LinearMethodBase):
         self.use_marlin = isinstance(self.fp8_linear, MarlinFP8ScaledMMLinearKernel)
 
     def process_weights_after_loading(self, layer: Module) -> None:
+        if self.use_marlin and self.block_quant and getattr(layer, "is_bmm", False):
+            assert not self.act_q_static
+            assert self.weight_block_size is not None
+            weight, weight_scale_inv = deepgemm_post_process_fp8_weight_block(
+                wq=layer.weight,
+                ws=layer.weight_scale_inv,
+                quant_block_shape=tuple(self.weight_block_size),
+                use_e8m0=is_deep_gemm_e8m0_used(),
+                is_bmm=True,
+                bmm_batch_size=getattr(layer, "bmm_batch_size", 0),
+            )
+            replace_parameter(layer, "weight", weight.data)
+            replace_parameter(layer, "weight_scale_inv", weight_scale_inv.data)
+            layer.input_scale = None
+            return
+
         if self.use_marlin:
             # Only Marlin kernels support `marlin_input_dtype`; guard to avoid
             # AttributeError if backend selection changes.

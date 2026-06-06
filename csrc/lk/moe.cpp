@@ -528,6 +528,9 @@ void MOE::forward_one(int k, const uint64_t* expert_ids, const float* weights, c
     }, nullptr);
 }
 void MOE::forward_many_m(int qlen, int k, const uint64_t* expert_ids, const float* weights, const void* input, void* output) {
+    std::vector<uint64_t> expert_ids_storage(expert_ids, expert_ids + qlen * k);
+    const uint64_t* expert_ids_local = expert_ids_storage.data();
+
     size_t gate_input_em = config_.hidden_size / gate_blk_size;
     size_t up_input_em = config_.hidden_size / up_blk_size;
     size_t down_input_em = config_.intermediate_size / down_blk_size;
@@ -544,7 +547,7 @@ void MOE::forward_many_m(int qlen, int k, const uint64_t* expert_ids, const floa
     for (int i = 0; i < qlen; i++) {   
         token_expert_mapping [i].resize(k);
         for (int j = 0; j < k; j++) { 
-            uint64_t expert_id =  expert_ids[i * k + j];
+            uint64_t expert_id =  expert_ids_local[i * k + j];
             token_expert_mapping [i][j] = std::make_pair(expert_id, expert_selected_num[expert_id]++);
         }
     }
@@ -597,7 +600,7 @@ void MOE::forward_many_m(int qlen, int k, const uint64_t* expert_ids, const floa
         int nid = Backend_NUMA::numa_node_;  
         int token_id = task_id / k;
         int expert_idx =  task_id % k;
-        uint64_t expert_id = expert_ids[token_id * k + expert_idx];  
+        uint64_t expert_id = expert_ids_local[token_id * k + expert_idx];  
  
         uint64_t expert_id_from_mapping = token_expert_mapping[token_id][expert_idx].first;
          
@@ -888,4 +891,3 @@ static void sync_(void * moe_ptr) {
 void MOE::sync_with_cuda_stream(intptr_t user_cuda_stream) { 
     cudaLaunchHostFunc((cudaStream_t)user_cuda_stream, (cudaHostFn_t)&sync_, (void*)this);
 }
-

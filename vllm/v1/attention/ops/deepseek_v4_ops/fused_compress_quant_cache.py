@@ -1209,12 +1209,27 @@ try:
         token_stride: int,
         scale_dim: int,
     ) -> None:
-        # NOTE: Triton variant (_fused_kv_compress_sparse_attn_sm86_triton)
-        # exists below but causes ~44% E2E regression because per-token
-        # kernel launches dominate when compress_ratio is large (most
-        # tokens early-exit). Pyref's batched-via-nonzero approach wins
-        # here. Future: write a BATCHED Triton kernel processing only
-        # emit tokens. Until then, dispatch through pyref.
+        # Pyref's batched-via-nonzero path is faster outside CUDA graphs, but
+        # nonzero() is not capture-safe. Use the fixed-grid Triton variant only
+        # while CUDA graph capture is active.
+        if torch.cuda.is_current_stream_capturing():
+            _fused_kv_compress_sparse_attn_sm86_triton(
+                state_cache, token_to_req_indices, positions, slot_mapping,
+                block_table, block_size,
+                rms_norm_weight, rms_norm_eps,
+                cos_sin_cache,
+                k_cache, kv_slot_mapping, kv_cache_block_size,
+                head_size=head_size,
+                state_width=state_width,
+                compress_ratio=compress_ratio,
+                overlap=overlap,
+                rope_head_dim=rope_head_dim,
+                fp8_max=fp8_max,
+                quant_block=quant_block,
+                token_stride=token_stride,
+                scale_dim=scale_dim,
+            )
+            return
         _fused_kv_compress_sparse_attn_pyref(
             state_cache, token_to_req_indices, positions, slot_mapping,
             block_table, block_size,
@@ -1266,6 +1281,24 @@ try:
         scale_dim: int,
     ) -> None:
         # See note on sparse_attn op above; same regression pattern.
+        if torch.cuda.is_current_stream_capturing():
+            _fused_kv_compress_indexer_attn_sm86_triton(
+                state_cache, token_to_req_indices, positions, slot_mapping,
+                block_table, block_size,
+                rms_norm_weight, rms_norm_eps,
+                cos_sin_cache,
+                k_cache, kv_slot_mapping, kv_cache_block_size,
+                head_size=head_size,
+                state_width=state_width,
+                compress_ratio=compress_ratio,
+                overlap=overlap,
+                rope_head_dim=rope_head_dim,
+                fp8_max=fp8_max,
+                quant_block=quant_block,
+                token_stride=token_stride,
+                scale_dim=scale_dim,
+            )
+            return
         _fused_kv_compress_indexer_attn_pyref(
             state_cache, token_to_req_indices, positions, slot_mapping,
             block_table, block_size,
