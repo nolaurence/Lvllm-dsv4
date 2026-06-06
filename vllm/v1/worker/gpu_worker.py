@@ -65,6 +65,26 @@ from .utils import request_memory
 
 logger = init_logger(__name__)
 
+
+def _parse_positive_int_env(name: str) -> int | None:
+    value = os.getenv(name)
+    if value is None:
+        return None
+    try:
+        parsed = int(value)
+    except ValueError:
+        logger.warning(
+            "Ignoring invalid %s=%r; expected a positive integer.", name, value
+        )
+        return None
+    if parsed <= 0:
+        logger.warning(
+            "Ignoring invalid %s=%r; expected a positive integer.", name, value
+        )
+        return None
+    return parsed
+
+
 if TYPE_CHECKING:
     from vllm.model_executor.model_loader.tensorizer import TensorizerConfig
     from vllm.v1.worker.gpu_model_runner import GPUModelRunner
@@ -153,6 +173,48 @@ class Worker(WorkerBase):
         self.use_v2_model_runner = envs.VLLM_USE_V2_MODEL_RUNNER
         # pending non-blocking PP send work from the previous iteration
         self._pp_send_work: list[Handle] = []
+
+    def _configure_lk_threads_for_worker(self) -> None:
+        if os.getenv("LVLLM_MOE_NUMA_ENABLED") != "1":
+            return
+
+        split_enabled = os.getenv("LVLLM_SPLIT_LK_THREADS", "1").lower()
+        if split_enabled not in ("1", "true", "yes", "on"):
+            return
+
+        total_threads = _parse_positive_int_env("LVLLM_LK_THREADS_TOTAL")
+        source_env = "LVLLM_LK_THREADS_TOTAL"
+        if total_threads is None:
+            total_threads = _parse_positive_int_env("LK_THREADS_TOTAL")
+            source_env = "LK_THREADS_TOTAL"
+        if total_threads is None:
+            total_threads = _parse_positive_int_env("LK_THREADS")
+            source_env = "LK_THREADS"
+        if total_threads is None:
+            return
+
+        local_world_size = max(1, self.parallel_config.local_world_size)
+        worker_local_rank = self.local_rank % local_world_size
+        base_threads = total_threads // local_world_size
+        extra_threads = total_threads % local_world_size
+        worker_threads = base_threads + int(worker_local_rank < extra_threads)
+        worker_threads = max(1, worker_threads)
+        worker_cpu_offset = base_threads * worker_local_rank + min(
+            worker_local_rank, extra_threads
+        )
+
+        os.environ["LK_THREADS"] = str(worker_threads)
+        os.environ["LK_CPU_OFFSET"] = str(worker_cpu_offset)
+        logger.info(
+            "Configured LK_THREADS=%d and LK_CPU_OFFSET=%d for local worker "
+            "rank %d/%d from %s=%d.",
+            worker_threads,
+            worker_cpu_offset,
+            worker_local_rank,
+            local_world_size,
+            source_env,
+            total_threads,
+        )
 
     def sleep(self, level: int = 1) -> None:
         from vllm.device_allocator.cumem import CuMemAllocator
@@ -250,6 +312,8 @@ class Worker(WorkerBase):
                     f"be less than or equal to the number of visible devices "
                     f"({visible_device_count})."
                 )
+
+            self._configure_lk_threads_for_worker()
 
             self.device = torch.device(f"cuda:{self.local_rank}")
             torch.accelerator.set_device_index(self.device)

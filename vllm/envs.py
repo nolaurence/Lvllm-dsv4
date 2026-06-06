@@ -1657,6 +1657,10 @@ environment_variables: dict[str, Callable[[], Any]] = {
     # Whether to enable NUMA for MOE.
     "LVLLM_MOE_NUMA_ENABLED":
     lambda: bool(int(os.getenv("LVLLM_MOE_NUMA_ENABLED", "0"))),
+    # Cap the startup profile dummy batch when lk::MOE CPU offload is enabled.
+    # Set to 0 to profile with the full scheduler max_num_batched_tokens.
+    "LVLLM_MOE_PROFILE_MAX_TOKENS":
+    lambda: int(os.getenv("LVLLM_MOE_PROFILE_MAX_TOKENS", "8192")),
     # Disables parallel execution of shared_experts via separate cuda stream
     "VLLM_DISABLE_SHARED_EXPERTS_STREAM": lambda: bool(
         int(os.getenv("VLLM_DISABLE_SHARED_EXPERTS_STREAM", "0"))

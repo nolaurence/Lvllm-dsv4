@@ -35,6 +35,7 @@
 #include <queue> 
 
 class MOE;
+void cpu_decode_forward_wrapper(void* args);
 struct ForwardParams {
     MOE* moe_ptr;
     int qlen;
@@ -75,6 +76,9 @@ class MOE {
     ~MOE();
     void warm_up();
     void forward(int qlen, int k, const uint64_t* expert_ids, const float* weights, const void* input, void* output, int* bsz_tensor);
+    void cpu_decode(intptr_t user_cuda_stream, int qlen, int k,
+                    const uint64_t* expert_ids_dev, const float* weights_dev,
+                    const void* input_dev, void* output_dev);
     void submit_with_cuda_stream(intptr_t user_cuda_stream, int qlen, int k, const uint64_t* expert_ids, 
                              const float* weights, const void* input, void* output, int* bsz_tensor);
     void sync_with_cuda_stream(intptr_t user_cuda_stream);
@@ -86,6 +90,7 @@ class MOE {
     using ForwardManyImpl = void (MOE::*)(int, int, const uint64_t*, const float*, const void*, void*);
     ForwardOneImpl forward_one_impl;
     ForwardManyImpl forward_many_impl;
+    void ensure_decode_buffers(int qlen, int k);
     MOEConfig config_;
     void* gate_proj_;  // [expert_num * intermediate_size * hidden_size ( /32 if quantized)]
     void* up_proj_;    // [expert_num * intermediate_size * hidden_size ( /32 if quantized)]
@@ -154,6 +159,17 @@ class MOE {
     bool use_fp32_buffer_; 
 
     std::atomic<bool> sync_flag{false};
+
+    uint64_t* decode_expert_ids_host_ = nullptr;
+    float* decode_weights_host_ = nullptr;
+    void* decode_input_host_ = nullptr;
+    void* decode_output_host_ = nullptr;
+    int* decode_bsz_host_ = nullptr;
+    size_t decode_expert_ids_capacity_bytes_ = 0;
+    size_t decode_weights_capacity_bytes_ = 0;
+    size_t decode_input_capacity_bytes_ = 0;
+    size_t decode_output_capacity_bytes_ = 0;
+    friend void cpu_decode_forward_wrapper(void* args);
 
     
 };

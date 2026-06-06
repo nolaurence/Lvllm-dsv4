@@ -10,6 +10,8 @@
 #include "moe.h"
 #include <iostream>
 #include <cstdint>
+#include <stdexcept>
+#include <string>
 
 #ifdef USE_NUMA
 #include <numa.h>
@@ -322,6 +324,21 @@ MOE::~MOE() {
         free_aligned(m_up_input_ , config_.group_max_len * config_.routed_expert_num * config_.hidden_size * up_vec_dot_type_size / up_vec_dot_blk_size);
     }else{
         free_aligned(m_gate_input_, config_.group_max_len * config_.routed_expert_num * sizeof(float) * config_.hidden_size);
+    }
+    if (decode_expert_ids_host_ != nullptr) {
+        cudaFreeHost(decode_expert_ids_host_);
+    }
+    if (decode_weights_host_ != nullptr) {
+        cudaFreeHost(decode_weights_host_);
+    }
+    if (decode_input_host_ != nullptr) {
+        cudaFreeHost(decode_input_host_);
+    }
+    if (decode_output_host_ != nullptr) {
+        cudaFreeHost(decode_output_host_);
+    }
+    if (decode_bsz_host_ != nullptr) {
+        cudaFreeHost(decode_bsz_host_);
     }
 }
 
@@ -861,6 +878,112 @@ static void forward_wrapper(void* args) {
             params->bsz_tensor
         );
         // delete params;  !don't delete params here
+}
+
+void MOE::ensure_decode_buffers(int qlen, int k) {
+    const size_t expert_ids_bytes = static_cast<size_t>(qlen) * k * sizeof(uint64_t);
+    const size_t weights_bytes = static_cast<size_t>(qlen) * k * sizeof(float);
+    const size_t hidden_bytes = static_cast<size_t>(qlen) * config_.hidden_size *
+                                hidden_type_size / hidden_blk_size;
+
+    auto resize_host = [](void** ptr, size_t* capacity, size_t needed) {
+        if (*capacity >= needed) {
+            return;
+        }
+        if (*ptr != nullptr) {
+            cudaFreeHost(*ptr);
+            *ptr = nullptr;
+            *capacity = 0;
+        }
+        cudaError_t err = cudaHostAlloc(ptr, needed, cudaHostAllocPortable);
+        if (err != cudaSuccess) {
+            throw std::runtime_error(std::string("cudaHostAlloc failed: ") +
+                                     cudaGetErrorString(err));
+        }
+        *capacity = needed;
+    };
+
+    resize_host(reinterpret_cast<void**>(&decode_expert_ids_host_),
+                &decode_expert_ids_capacity_bytes_, expert_ids_bytes);
+    resize_host(reinterpret_cast<void**>(&decode_weights_host_),
+                &decode_weights_capacity_bytes_, weights_bytes);
+    resize_host(&decode_input_host_, &decode_input_capacity_bytes_, hidden_bytes);
+    resize_host(&decode_output_host_, &decode_output_capacity_bytes_, hidden_bytes);
+    if (decode_bsz_host_ == nullptr) {
+        cudaError_t err = cudaHostAlloc(reinterpret_cast<void**>(&decode_bsz_host_),
+                                        sizeof(int), cudaHostAllocPortable);
+        if (err != cudaSuccess) {
+            throw std::runtime_error(std::string("cudaHostAlloc failed: ") +
+                                     cudaGetErrorString(err));
+        }
+    }
+}
+
+struct CpuDecodeParams {
+    MOE* moe_ptr;
+    int qlen;
+    int k;
+};
+
+void cpu_decode_forward_wrapper(void* args) {
+    CpuDecodeParams* params = static_cast<CpuDecodeParams*>(args);
+    params->moe_ptr->forward(
+        params->qlen,
+        params->k,
+        params->moe_ptr->decode_expert_ids_host_,
+        params->moe_ptr->decode_weights_host_,
+        params->moe_ptr->decode_input_host_,
+        params->moe_ptr->decode_output_host_,
+        params->moe_ptr->decode_bsz_host_);
+    delete params;
+}
+
+void MOE::cpu_decode(intptr_t user_cuda_stream, int qlen, int k,
+                     const uint64_t* expert_ids_dev, const float* weights_dev,
+                     const void* input_dev, void* output_dev) {
+    ensure_decode_buffers(qlen, k);
+    decode_bsz_host_[0] = qlen;
+
+    cudaStream_t stream = reinterpret_cast<cudaStream_t>(user_cuda_stream);
+    const size_t expert_ids_bytes = static_cast<size_t>(qlen) * k * sizeof(uint64_t);
+    const size_t weights_bytes = static_cast<size_t>(qlen) * k * sizeof(float);
+    const size_t hidden_bytes = static_cast<size_t>(qlen) * config_.hidden_size *
+                                hidden_type_size / hidden_blk_size;
+
+    cudaError_t err = cudaMemcpyAsync(decode_expert_ids_host_, expert_ids_dev,
+                                      expert_ids_bytes, cudaMemcpyDeviceToHost,
+                                      stream);
+    if (err != cudaSuccess) {
+        throw std::runtime_error(std::string("cudaMemcpyAsync expert ids failed: ") +
+                                 cudaGetErrorString(err));
+    }
+    err = cudaMemcpyAsync(decode_weights_host_, weights_dev, weights_bytes,
+                          cudaMemcpyDeviceToHost, stream);
+    if (err != cudaSuccess) {
+        throw std::runtime_error(std::string("cudaMemcpyAsync weights failed: ") +
+                                 cudaGetErrorString(err));
+    }
+    err = cudaMemcpyAsync(decode_input_host_, input_dev, hidden_bytes,
+                          cudaMemcpyDeviceToHost, stream);
+    if (err != cudaSuccess) {
+        throw std::runtime_error(std::string("cudaMemcpyAsync input failed: ") +
+                                 cudaGetErrorString(err));
+    }
+
+    CpuDecodeParams* params = new CpuDecodeParams{this, qlen, k};
+    err = cudaLaunchHostFunc(stream, &cpu_decode_forward_wrapper, params);
+    if (err != cudaSuccess) {
+        delete params;
+        throw std::runtime_error(std::string("cudaLaunchHostFunc failed: ") +
+                                 cudaGetErrorString(err));
+    }
+
+    err = cudaMemcpyAsync(output_dev, decode_output_host_, hidden_bytes,
+                          cudaMemcpyHostToDevice, stream);
+    if (err != cudaSuccess) {
+        throw std::runtime_error(std::string("cudaMemcpyAsync output failed: ") +
+                                 cudaGetErrorString(err));
+    }
 }
 
 void MOE::submit_with_cuda_stream(intptr_t user_cuda_stream, int qlen, int k, const uint64_t* expert_ids, 

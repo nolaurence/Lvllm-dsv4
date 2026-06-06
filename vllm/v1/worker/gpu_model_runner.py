@@ -5844,9 +5844,23 @@ class GPUModelRunner(
                         for i, output in enumerate(dummy_encoder_outputs):
                             self.encoder_cache[f"tmp_{i}"] = output
 
+        profile_num_tokens = self.max_num_tokens
+        if envs.LVLLM_MOE_NUMA_ENABLED and envs.LVLLM_MOE_PROFILE_MAX_TOKENS > 0:
+            profile_num_tokens = min(
+                profile_num_tokens, envs.LVLLM_MOE_PROFILE_MAX_TOKENS
+            )
+            if profile_num_tokens < self.max_num_tokens:
+                logger.info(
+                    "Capping lk::MOE CPU-offload profile run from %d to %d "
+                    "tokens. Set LVLLM_MOE_PROFILE_MAX_TOKENS=0 to restore "
+                    "full profiling.",
+                    self.max_num_tokens,
+                    profile_num_tokens,
+                )
+
         # Add `is_profile` here to pre-allocate communication buffers
         hidden_states, last_hidden_states = self._dummy_run(
-            self.max_num_tokens, is_profile=True
+            profile_num_tokens, is_profile=True
         )
         if get_pp_group().is_last_rank:
             if self.is_pooling_model:

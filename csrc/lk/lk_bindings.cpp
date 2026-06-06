@@ -46,6 +46,26 @@ PYBIND11_MODULE(_lk_C, m) {
                 );
             }
         )
+        .def("cpu_decode",
+            [](MOE& self,
+               intptr_t user_cuda_stream,
+               int qlen,
+               int k,
+               intptr_t expert_ids,
+               intptr_t weights,
+               intptr_t input,
+               intptr_t output) {
+                self.cpu_decode(
+                    user_cuda_stream,
+                    qlen,
+                    k,
+                    (const uint64_t*)expert_ids,
+                    (const float*)weights,
+                    (const void*)input,
+                    (void*)output
+                );
+            }
+        )
         .def("forward",
             [](MOE& self,
                int qlen,

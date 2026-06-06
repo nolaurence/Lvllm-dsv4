@@ -19,6 +19,8 @@
 #include <fstream>
 #include <set>
 #include <algorithm> 
+#include <cctype>
+#include <cstdlib>
 // #define __AMX_INT8__ 1
 // #define __AVX512VNNI__ 1
 #if defined(__AMX_INT8__) && defined(__AVX512VNNI__)
@@ -134,6 +136,25 @@ Backend_NUMA::Backend_NUMA(int num_threads) {
  
     max_threads_ = num_threads < numa_nodes_ ? numa_nodes_ : num_threads;  
     max_threads_ = max_threads_ > num_cpus_ - 2 ? num_cpus_ - 2 : max_threads_;
+    int cpu_offset = 0;
+    const char* env_cpu_offset = std::getenv("LK_CPU_OFFSET");
+    if (env_cpu_offset != nullptr) {
+        bool is_valid = true;
+        for (const char* p = env_cpu_offset; *p != '\0'; ++p) {
+            if (!std::isdigit(static_cast<unsigned char>(*p))) {
+                is_valid = false;
+                break;
+            }
+        }
+        if (is_valid) {
+            cpu_offset = std::atoi(env_cpu_offset);
+            if (cpu_offset < 0) {
+                cpu_offset = 0;
+            }
+            std::cout << "Using LK_CPU_OFFSET from environment: "
+                      << cpu_offset << std::endl;
+        }
+    }
 
     node_threads_.resize(numa_nodes_);
     threads_info_.resize(max_threads_);
@@ -148,8 +169,10 @@ Backend_NUMA::Backend_NUMA(int num_threads) {
         node_threads_[nid].clear();
         node_threads_[nid].reserve(n); 
         int n_find = 0;
-        for(int cid = 0; cid < num_cpus_; ++cid){
+        int start_cid = cpu_offset % num_cpus_;
+        for(int cid_offset = 0; cid_offset < num_cpus_; ++cid_offset){
             if(n_find == n) break; 
+            int cid = (start_cid + cid_offset) % num_cpus_;
             if(cpus_info_[cid].node_id == nid){
                 auto& this_cpu = cpus_info_[cid];
                 threads_info_[tid] = {
@@ -358,11 +381,21 @@ void Backend_NUMA::worker_thread(int thread_id) {
     thread_local_id_ = thread_id;
     numa_node_ = threads_info_[thread_id].node_id; 
     int cpu_id = threads_info_[thread_id].cpu_id;
+    const char* env_thread_binding = std::getenv("LK_THREAD_BINDING");
+    bool bind_cpu_core = false;
+    if (env_thread_binding != nullptr) {
+        std::string val(env_thread_binding);
+        std::transform(val.begin(), val.end(), val.begin(), ::tolower);
+        bind_cpu_core = val == "cpu_core";
+    }
 
     assert(numa_node_ == numa_node_of_cpu(cpu_id));
      
-    
-    bind_to_numa_node(numa_node_);
+    if (bind_cpu_core) {
+        bind_to_cpu(cpu_id);
+    } else {
+        bind_to_numa_node(numa_node_);
+    }
     set_numa_mempolicy(numa_node_);
 
     #if defined(__AMX_INT8__) && defined(__AVX512VNNI__)
@@ -483,4 +516,3 @@ void free_aligned(void* aligned_ptr, size_t size) {
     void* raw_ptr = *prev_ptr;
     free(raw_ptr);
 }
-

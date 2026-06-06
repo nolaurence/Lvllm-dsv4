@@ -1121,6 +1121,12 @@ class FusedMoE(PluggableLayer):
         self.lk_moe = None
         self.lk_moe_config = None
         self._lk_moe_init_lock = threading.Lock()
+        self._lk_cpu_buffers: dict[
+            tuple[str, tuple[int, ...], torch.dtype], torch.Tensor
+        ] = {}
+        self._lk_gpu_buffers: dict[
+            tuple[str, tuple[int, ...], torch.dtype, int], torch.Tensor
+        ] = {}
 
 
         if params_dtype is None:
@@ -1557,8 +1563,8 @@ class FusedMoE(PluggableLayer):
 
         weight_i32 = weight.to(torch.int32)
         out = torch.empty(n_dim, k_dim, dtype=torch.bfloat16, device=device)
-        out[:, 0::2] = lut[(weight_i32 >> 4) & 0xF]
-        out[:, 1::2] = lut[weight_i32 & 0xF]
+        out[:, 0::2] = lut[weight_i32 & 0xF]
+        out[:, 1::2] = lut[(weight_i32 >> 4) & 0xF]
         return out.mul_(scales)
 
     @staticmethod
@@ -2580,6 +2586,72 @@ class FusedMoE(PluggableLayer):
                 self.quant_method.get_fused_moe_quant_config(self)
             )
 
+    def _get_lk_cpu_buffer(
+        self,
+        name: str,
+        shape: tuple[int, ...],
+        dtype: torch.dtype,
+        *,
+        pin_memory: bool = True,
+    ) -> torch.Tensor:
+        key = (name, shape, dtype)
+        buf = self._lk_cpu_buffers.get(key)
+        if buf is None:
+            buf = torch.empty(
+                shape,
+                dtype=dtype,
+                device="cpu",
+                pin_memory=pin_memory and torch.cuda.is_available(),
+            )
+            self._lk_cpu_buffers[key] = buf
+        return buf
+
+    def _get_lk_gpu_buffer(
+        self,
+        name: str,
+        shape: tuple[int, ...],
+        dtype: torch.dtype,
+        device: torch.device,
+    ) -> torch.Tensor:
+        device_index = device.index
+        if device_index is None:
+            device_index = torch.cuda.current_device()
+        key = (name, shape, dtype, device_index)
+        buf = self._lk_gpu_buffers.get(key)
+        if buf is None:
+            buf = torch.empty(
+                shape,
+                dtype=dtype,
+                device=torch.device("cuda", device_index),
+            )
+            self._lk_gpu_buffers[key] = buf
+        return buf
+
+    def _forward_lk_cuda_decode(
+        self,
+        hidden_states: torch.Tensor,
+        topk_weights: torch.Tensor,
+        mapped_topk_ids: torch.Tensor,
+    ) -> torch.Tensor:
+        qlen = hidden_states.shape[0]
+        k = mapped_topk_ids.shape[1]
+        hidden_states = hidden_states.contiguous()
+        mapped_topk_ids = mapped_topk_ids.to(dtype=torch.int64).contiguous()
+        topk_weights = topk_weights.to(dtype=torch.float32).contiguous()
+        output = self._get_lk_gpu_buffer(
+            "output", tuple(hidden_states.shape), hidden_states.dtype,
+            hidden_states.device)
+        self.lk_moe.cpu_decode(
+            torch.cuda.current_stream(hidden_states.device).cuda_stream,
+            qlen,
+            k,
+            mapped_topk_ids.data_ptr(),
+            topk_weights.data_ptr(),
+            hidden_states.data_ptr(),
+            output.data_ptr(),
+        )
+        return output
+
     def forward_lk(
         self,
         hidden_states: torch.Tensor,
@@ -2608,6 +2680,13 @@ class FusedMoE(PluggableLayer):
             )[topk_ids_i64]
         else:
             mapped_topk_ids = topk_ids_i64
+
+        if (hidden_states.is_cuda
+                and os.getenv("LVLLM_DISABLE_LK_CPU_DECODE_BRIDGE", "0") != "1"
+                and hasattr(self.lk_moe, "cpu_decode")):
+            return self._forward_lk_cuda_decode(
+                hidden_states, topk_weights, mapped_topk_ids)
+
         if torch.any((mapped_topk_ids < 0)
                      | (mapped_topk_ids >= self.local_num_experts)):
             invalid = mapped_topk_ids[
@@ -2620,20 +2699,33 @@ class FusedMoE(PluggableLayer):
                 f"{self.local_num_experts}"
             )
 
-        input_cpu = hidden_states.detach().to("cpu", non_blocking=True).contiguous()
-        expert_ids_cpu = mapped_topk_ids.detach().to(
-            "cpu", dtype=torch.uint64, non_blocking=True
-        ).contiguous()
-        weights_cpu = topk_weights.detach().to(
-            "cpu", dtype=torch.float32, non_blocking=True
-        ).contiguous()
-        output_cpu = torch.empty(
-            input_cpu.shape,
-            dtype=input_cpu.dtype,
-            device="cpu",
-            pin_memory=True,
-        ).contiguous()
-        bsz_cpu = torch.tensor([qlen], dtype=torch.int32, device="cpu")
+        input_cpu = self._get_lk_cpu_buffer(
+            "input", tuple(hidden_states.shape), hidden_states.dtype
+        )
+        expert_ids_cpu = self._get_lk_cpu_buffer(
+            "expert_ids", tuple(mapped_topk_ids.shape), torch.uint64
+        )
+        weights_cpu = self._get_lk_cpu_buffer(
+            "weights", tuple(topk_weights.shape), torch.float32
+        )
+        output_cpu = self._get_lk_cpu_buffer(
+            "output", tuple(hidden_states.shape), hidden_states.dtype
+        )
+        bsz_cpu = self._get_lk_cpu_buffer("bsz", (1,), torch.int32)
+        bsz_cpu[0] = qlen
+
+        input_cpu.copy_(hidden_states.detach(), non_blocking=True)
+        expert_ids_cpu.copy_(
+            mapped_topk_ids.detach().to(dtype=torch.uint64),
+            non_blocking=True,
+        )
+        weights_cpu.copy_(
+            topk_weights.detach().to(dtype=torch.float32),
+            non_blocking=True,
+        )
+        if hidden_states.is_cuda or topk_weights.is_cuda or mapped_topk_ids.is_cuda:
+            torch.cuda.current_stream(hidden_states.device).synchronize()
+
         self.lk_moe.forward(
             qlen,
             k,
