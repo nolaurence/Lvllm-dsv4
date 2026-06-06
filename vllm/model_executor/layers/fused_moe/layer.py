@@ -1577,7 +1577,9 @@ class FusedMoE(PluggableLayer):
         safe_scale = torch.where(scale_f32 == 0, torch.ones_like(scale_f32), scale_f32)
         qs = torch.round(blocks / safe_scale.unsqueeze(-1) + 8.0)
         qs = torch.clamp(qs, 0, 15).to(torch.uint8)
-        packed = qs[..., 0::2] | (qs[..., 1::2] << 4)
+        # GGML Q4_0 packs a 32-value block as 16 bytes: low nibbles hold
+        # values 0..15 and high nibbles hold values 16..31.
+        packed = qs[..., :16] | (qs[..., 16:] << 4)
         block_bytes = torch.empty((*blocks.shape[:2], 18),
                                   dtype=torch.uint8,
                                   device=weight.device)
@@ -2588,8 +2590,38 @@ class FusedMoE(PluggableLayer):
             raise RuntimeError("lk::MOE is not initialized")
         qlen = hidden_states.shape[0]
         k = topk_ids.shape[1]
+
+        topk_ids_i64 = topk_ids.to(torch.int64)
+        if self._expert_map is not None:
+            if torch.any((topk_ids_i64 < 0)
+                         | (topk_ids_i64 >= self._expert_map.numel())):
+                invalid = topk_ids_i64[
+                    (topk_ids_i64 < 0) | (topk_ids_i64 >= self._expert_map.numel())
+                ][:16].detach().cpu().tolist()
+                raise RuntimeError(
+                    f"lk::MOE got invalid global expert ids for layer "
+                    f"{self.layer_name}: {invalid}; global_num_experts="
+                    f"{self._expert_map.numel()}"
+                )
+            mapped_topk_ids = self._expert_map.to(
+                device=topk_ids.device, dtype=torch.int64
+            )[topk_ids_i64]
+        else:
+            mapped_topk_ids = topk_ids_i64
+        if torch.any((mapped_topk_ids < 0)
+                     | (mapped_topk_ids >= self.local_num_experts)):
+            invalid = mapped_topk_ids[
+                (mapped_topk_ids < 0)
+                | (mapped_topk_ids >= self.local_num_experts)
+            ][:16].detach().cpu().tolist()
+            raise RuntimeError(
+                f"lk::MOE got out-of-range expert ids for layer "
+                f"{self.layer_name}: {invalid}; local_num_experts="
+                f"{self.local_num_experts}"
+            )
+
         input_cpu = hidden_states.detach().to("cpu", non_blocking=True).contiguous()
-        expert_ids_cpu = topk_ids.detach().to(
+        expert_ids_cpu = mapped_topk_ids.detach().to(
             "cpu", dtype=torch.uint64, non_blocking=True
         ).contiguous()
         weights_cpu = topk_weights.detach().to(
