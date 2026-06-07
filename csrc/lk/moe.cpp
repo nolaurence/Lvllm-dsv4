@@ -8,8 +8,9 @@
  * @Copyright (c) 2024 by KVCache.AI, All Rights Reserved.
  **/
 #include "moe.h"
-#include <iostream>
 #include <cstdint>
+#include <cstdlib>
+#include <iostream>
 #include <stdexcept>
 #include <string>
 
@@ -37,7 +38,20 @@ MOE::MOE(MOEConfig config) {
 
     ggml_init(pdata);
 
-    config_.stride = 32;
+    if (config_.stride <= 0 || config_.stride % 32 != 0 ||
+        config_.hidden_size % config_.stride != 0 ||
+        config_.intermediate_size % config_.stride != 0) {
+        std::cerr << "Invalid MOE stride " << config_.stride
+                  << ", falling back to 32" << std::endl;
+        config_.stride = 32;
+    }
+    const char* profile_env = std::getenv("LVLLM_LK_PROFILE");
+    profile_enabled_ = profile_env != nullptr && std::string(profile_env) == "1";
+    const char* profile_detailed_env =
+        std::getenv("LVLLM_LK_PROFILE_DETAILED");
+    profile_detailed_enabled_ =
+        profile_detailed_env != nullptr &&
+        std::string(profile_detailed_env) == "1";
     use_fp32_buffer_ = false;
     #if defined(__AMX_INT8__) && defined(__AVX512VNNI__)
     std::cout << "AMX enabled ...... " << std::endl;
@@ -340,6 +354,9 @@ MOE::~MOE() {
     if (decode_bsz_host_ != nullptr) {
         cudaFreeHost(decode_bsz_host_);
     }
+    for (CpuDecodeParams* params : decode_params_) {
+        delete params;
+    }
 }
 
 void MOE::warm_up() {
@@ -412,6 +429,9 @@ static void act_fn(float* up, float* gate, int n) {
 }
 
 void MOE::forward_one(int k, const uint64_t* expert_ids, const float* weights, const void* input, void* output) {
+    const auto profile_start = profile_enabled_
+                                   ? std::chrono::steady_clock::now()
+                                   : std::chrono::steady_clock::time_point{};
     
     const void* gate_input_ptr;
     const void* up_input_ptr;
@@ -543,6 +563,22 @@ void MOE::forward_one(int k, const uint64_t* expert_ids, const float* weights, c
         void * output_ptr = (uint8_t*)output + ith * config_.stride * hidden_type_size / hidden_blk_size;
         from_float(down_output_ptr_0, output_ptr, config_.stride, config_.hidden_type);
     }, nullptr);
+    if (profile_enabled_) {
+        const auto profile_end = std::chrono::steady_clock::now();
+        profile_forward_one_ms_ +=
+            std::chrono::duration<double, std::milli>(profile_end - profile_start)
+                .count();
+        profile_forward_one_calls_++;
+        if (profile_forward_one_calls_ % 32 == 0) {
+            std::cerr << "LK_MOE_PROFILE forward_one calls="
+                      << profile_forward_one_calls_
+                      << " avg_ms="
+                      << (profile_forward_one_ms_ /
+                          static_cast<double>(profile_forward_one_calls_))
+                      << " stride=" << config_.stride
+                      << " k=" << k << std::endl;
+        }
+    }
 }
 void MOE::forward_many_m(int qlen, int k, const uint64_t* expert_ids, const float* weights, const void* input, void* output) {
     std::vector<uint64_t> expert_ids_storage(expert_ids, expert_ids + qlen * k);
@@ -919,14 +955,28 @@ void MOE::ensure_decode_buffers(int qlen, int k) {
     }
 }
 
-struct CpuDecodeParams {
-    MOE* moe_ptr;
-    int qlen;
-    int k;
-};
+CpuDecodeParams* MOE::get_decode_params(int qlen, int k) {
+    for (CpuDecodeParams* params : decode_params_) {
+        if (params->qlen == qlen && params->k == k) {
+            return params;
+        }
+    }
+    CpuDecodeParams* params = new CpuDecodeParams{this, qlen, k};
+    decode_params_.push_back(params);
+    return params;
+}
+
+void cpu_decode_profile_after_d2h_wrapper(void* args) {
+    CpuDecodeParams* params = static_cast<CpuDecodeParams*>(args);
+    params->profile_cpu_start = std::chrono::steady_clock::now();
+}
 
 void cpu_decode_forward_wrapper(void* args) {
     CpuDecodeParams* params = static_cast<CpuDecodeParams*>(args);
+    if (params->moe_ptr->profile_detailed_enabled_) {
+        params->profile_cpu_start = std::chrono::steady_clock::now();
+    }
+    params->moe_ptr->decode_bsz_host_[0] = params->qlen;
     params->moe_ptr->forward(
         params->qlen,
         params->k,
@@ -935,12 +985,47 @@ void cpu_decode_forward_wrapper(void* args) {
         params->moe_ptr->decode_input_host_,
         params->moe_ptr->decode_output_host_,
         params->moe_ptr->decode_bsz_host_);
-    delete params;
+    if (params->moe_ptr->profile_detailed_enabled_) {
+        params->profile_cpu_end = std::chrono::steady_clock::now();
+    }
+}
+
+void cpu_decode_profile_done_wrapper(void* args) {
+    CpuDecodeParams* params = static_cast<CpuDecodeParams*>(args);
+    MOE* moe = params->moe_ptr;
+    const auto end = std::chrono::steady_clock::now();
+    auto ms = [](const auto& a, const auto& b) {
+        return std::chrono::duration<double, std::milli>(b - a).count();
+    };
+    moe->profile_decode_total_ms_ += ms(params->profile_start, end);
+    moe->profile_decode_pre_cpu_ms_ +=
+        ms(params->profile_start, params->profile_cpu_start);
+    moe->profile_decode_cpu_ms_ +=
+        ms(params->profile_cpu_start, params->profile_cpu_end);
+    moe->profile_decode_post_cpu_ms_ += ms(params->profile_cpu_end, end);
+    moe->profile_cpu_decode_completed_calls_++;
+    if (moe->profile_cpu_decode_completed_calls_ % 32 == 0) {
+        const double calls =
+            static_cast<double>(moe->profile_cpu_decode_completed_calls_);
+        std::cerr << "LK_MOE_PROFILE_DETAIL cpu_decode_completed calls="
+                  << moe->profile_cpu_decode_completed_calls_
+                  << " avg_total_ms=" << (moe->profile_decode_total_ms_ / calls)
+                  << " avg_pre_cpu_ms="
+                  << (moe->profile_decode_pre_cpu_ms_ / calls)
+                  << " avg_cpu_ms=" << (moe->profile_decode_cpu_ms_ / calls)
+                  << " avg_post_cpu_ms="
+                  << (moe->profile_decode_post_cpu_ms_ / calls)
+                  << " qlen=" << params->qlen << " k=" << params->k
+                  << std::endl;
+    }
 }
 
 void MOE::cpu_decode(intptr_t user_cuda_stream, int qlen, int k,
                      const uint64_t* expert_ids_dev, const float* weights_dev,
                      const void* input_dev, void* output_dev) {
+    const auto profile_start = profile_enabled_
+                                   ? std::chrono::steady_clock::now()
+                                   : std::chrono::steady_clock::time_point{};
     ensure_decode_buffers(qlen, k);
     decode_bsz_host_[0] = qlen;
 
@@ -970,10 +1055,14 @@ void MOE::cpu_decode(intptr_t user_cuda_stream, int qlen, int k,
                                  cudaGetErrorString(err));
     }
 
-    CpuDecodeParams* params = new CpuDecodeParams{this, qlen, k};
+    CpuDecodeParams* params = get_decode_params(qlen, k);
+    if (profile_detailed_enabled_) {
+        params->profile_start = std::chrono::steady_clock::now();
+        params->profile_cpu_start = params->profile_start;
+        params->profile_cpu_end = params->profile_start;
+    }
     err = cudaLaunchHostFunc(stream, &cpu_decode_forward_wrapper, params);
     if (err != cudaSuccess) {
-        delete params;
         throw std::runtime_error(std::string("cudaLaunchHostFunc failed: ") +
                                  cudaGetErrorString(err));
     }
@@ -983,6 +1072,29 @@ void MOE::cpu_decode(intptr_t user_cuda_stream, int qlen, int k,
     if (err != cudaSuccess) {
         throw std::runtime_error(std::string("cudaMemcpyAsync output failed: ") +
                                  cudaGetErrorString(err));
+    }
+    if (profile_detailed_enabled_) {
+        err = cudaLaunchHostFunc(stream, &cpu_decode_profile_done_wrapper, params);
+        if (err != cudaSuccess) {
+            throw std::runtime_error(
+                std::string("cudaLaunchHostFunc profile done failed: ") +
+                cudaGetErrorString(err));
+        }
+    }
+    if (profile_enabled_) {
+        const auto profile_end = std::chrono::steady_clock::now();
+        profile_cpu_decode_enqueue_ms_ +=
+            std::chrono::duration<double, std::milli>(profile_end - profile_start)
+                .count();
+        profile_cpu_decode_calls_++;
+        if (profile_cpu_decode_calls_ % 32 == 0) {
+            std::cerr << "LK_MOE_PROFILE cpu_decode_enqueued calls="
+                      << profile_cpu_decode_calls_
+                      << " avg_enqueue_ms="
+                      << (profile_cpu_decode_enqueue_ms_ /
+                          static_cast<double>(profile_cpu_decode_calls_))
+                      << " qlen=" << qlen << " k=" << k << std::endl;
+        }
     }
 }
 

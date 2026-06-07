@@ -205,11 +205,16 @@ class Worker(WorkerBase):
 
         os.environ["LK_THREADS"] = str(worker_threads)
         os.environ["LK_CPU_OFFSET"] = str(worker_cpu_offset)
+        os.environ["OMP_NUM_THREADS"] = str(worker_threads)
+        os.environ.setdefault("MKL_NUM_THREADS", str(worker_threads))
+        torch.set_num_threads(worker_threads)
         logger.info(
-            "Configured LK_THREADS=%d and LK_CPU_OFFSET=%d for local worker "
+            "Configured LK_THREADS=%d, LK_CPU_OFFSET=%d, and "
+            "OMP_NUM_THREADS=%d for local worker "
             "rank %d/%d from %s=%d.",
             worker_threads,
             worker_cpu_offset,
+            worker_threads,
             worker_local_rank,
             local_world_size,
             source_env,

@@ -128,6 +128,58 @@ def _lvllm_moe_use_int4() -> bool:
     return os.getenv("LVLLM_MOE_USE_WEIGHT", "INT4").upper() == "INT4"
 
 
+def _lvllm_parse_moe_layers(spec: str) -> set[int]:
+    layers: set[int] = set()
+    for item in spec.split(","):
+        item = item.strip()
+        if not item:
+            continue
+        if "-" in item:
+            start_str, end_str = item.split("-", 1)
+            start = int(start_str)
+            end = int(end_str)
+            if end < start:
+                raise ValueError(
+                    "Layer range end must be >= start, got "
+                    f"{item!r}"
+                )
+            layers.update(range(start, end + 1))
+        else:
+            layers.add(int(item))
+    return layers
+
+
+def _lvllm_gpu_resident_moe_layer(layer_id: int | None) -> bool:
+    spec = os.getenv("LVLLM_GPU_RESIDENT_MOE_LAYERS", "")
+    if not spec or layer_id is None:
+        return False
+    try:
+        return layer_id in _lvllm_parse_moe_layers(spec)
+    except ValueError as err:
+        raise ValueError(
+            f"Invalid LVLLM_GPU_RESIDENT_MOE_LAYERS={spec!r}"
+        ) from err
+
+
+def _lvllm_moe_stride(hidden_size: int, intermediate_size: int) -> int:
+    raw_stride = os.getenv("LVLLM_MOE_STRIDE", "128")
+    try:
+        stride = int(raw_stride)
+    except ValueError:
+        stride = 128
+    if (stride <= 0 or stride % 32 != 0 or hidden_size % stride != 0
+            or intermediate_size % stride != 0):
+        logger.warning(
+            "Invalid LVLLM_MOE_STRIDE=%s for hidden_size=%d and "
+            "intermediate_size=%d; falling back to 32.",
+            raw_stride,
+            hidden_size,
+            intermediate_size,
+        )
+        return 32
+    return stride
+
+
 
 class FusedMoeWeightScaleSupported(Enum):
     TENSOR = "tensor"
@@ -436,7 +488,8 @@ class UnquantizedFusedMoEMethod(FusedMoEMethodBase, CustomOp):
         **extra_weight_attrs,
     ):
         device = torch.cuda.current_device() if current_platform.is_cuda_alike() else "cpu"
-        if isinstance(layer, FusedMoE) and is_lk_moe_numa_enabled():
+        if (isinstance(layer, FusedMoE) and is_lk_moe_numa_enabled()
+                and not _lvllm_gpu_resident_moe_layer(layer.layer_id)):
             device = "cpu"
         if self.moe.is_act_and_mul:
             w13_up_dim = 2 * intermediate_size_per_partition
@@ -1117,7 +1170,17 @@ class FusedMoE(PluggableLayer):
     ):
         super().__init__()
 
-        self.use_lk_moe = use_lk_moe and is_lk_moe_numa_enabled()
+        self.layer_name = prefix
+        resident_on_gpu = _lvllm_gpu_resident_moe_layer(self.layer_id)
+        self.use_lk_moe = (
+            use_lk_moe and is_lk_moe_numa_enabled() and not resident_on_gpu
+        )
+        if resident_on_gpu and is_lk_moe_numa_enabled():
+            logger.info(
+                "Keeping MoE layer %s resident on GPU; lk::MOE CPU offload "
+                "is disabled for this layer.",
+                self.layer_name,
+            )
         self.lk_moe = None
         self.lk_moe_config = None
         self._lk_moe_init_lock = threading.Lock()
@@ -1178,7 +1241,6 @@ class FusedMoE(PluggableLayer):
             raise ValueError("Duplicate layer name: {}".format(prefix))
         compilation_config.static_forward_context[prefix] = self
         compilation_config.static_all_moe_layers.append(prefix)
-        self.layer_name = prefix
 
         self.enable_eplb = enable_eplb
         # TODO(bnell): should this be owned by router?
@@ -1662,7 +1724,8 @@ class FusedMoE(PluggableLayer):
             self.top_k,
             self.hidden_size,
             self.intermediate_size_per_partition,
-            32,
+            _lvllm_moe_stride(self.hidden_size,
+                              self.intermediate_size_per_partition),
             10,
             1024,
             self._lk_gate_q4.data_ptr(),

@@ -21,6 +21,7 @@
 #include <algorithm> 
 #include <cctype>
 #include <cstdlib>
+#include <pthread.h>
 // #define __AMX_INT8__ 1
 // #define __AVX512VNNI__ 1
 #if defined(__AMX_INT8__) && defined(__AVX512VNNI__)
@@ -430,9 +431,22 @@ void bind_to_cpu(int cpu_id) {
     cpu_set_t cpuset;
     CPU_ZERO(&cpuset);
     CPU_SET(cpu_id, &cpuset);
-    
-    if (sched_setaffinity(0, sizeof(cpu_set_t), &cpuset) == -1) {
-        perror("sched_setaffinity failed");
+
+    if (pthread_setaffinity_np(pthread_self(), sizeof(cpu_set_t), &cpuset) != 0) {
+        perror("pthread_setaffinity_np failed");
+        exit(EXIT_FAILURE);
+    }
+
+    cpu_set_t actual_cpuset;
+    CPU_ZERO(&actual_cpuset);
+    if (pthread_getaffinity_np(pthread_self(), sizeof(cpu_set_t),
+                               &actual_cpuset) != 0) {
+        perror("pthread_getaffinity_np failed");
+        exit(EXIT_FAILURE);
+    }
+    if (!CPU_ISSET(cpu_id, &actual_cpuset)) {
+        std::cerr << "pthread affinity did not include requested cpu_id "
+                  << cpu_id << std::endl;
         exit(EXIT_FAILURE);
     }
 }

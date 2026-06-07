@@ -16,6 +16,7 @@
 #include <cstdio>
 #include <functional>
 #include <mutex>
+#include <chrono>
 #include <vector>
 
 #include "backend_numa.h"
@@ -36,6 +37,15 @@
 
 class MOE;
 void cpu_decode_forward_wrapper(void* args);
+void cpu_decode_profile_done_wrapper(void* args);
+struct CpuDecodeParams {
+    MOE* moe_ptr;
+    int qlen;
+    int k;
+    std::chrono::steady_clock::time_point profile_start;
+    std::chrono::steady_clock::time_point profile_cpu_start;
+    std::chrono::steady_clock::time_point profile_cpu_end;
+};
 struct ForwardParams {
     MOE* moe_ptr;
     int qlen;
@@ -91,6 +101,7 @@ class MOE {
     ForwardOneImpl forward_one_impl;
     ForwardManyImpl forward_many_impl;
     void ensure_decode_buffers(int qlen, int k);
+    CpuDecodeParams* get_decode_params(int qlen, int k);
     MOEConfig config_;
     void* gate_proj_;  // [expert_num * intermediate_size * hidden_size ( /32 if quantized)]
     void* up_proj_;    // [expert_num * intermediate_size * hidden_size ( /32 if quantized)]
@@ -169,7 +180,20 @@ class MOE {
     size_t decode_weights_capacity_bytes_ = 0;
     size_t decode_input_capacity_bytes_ = 0;
     size_t decode_output_capacity_bytes_ = 0;
+    bool profile_enabled_ = false;
+    bool profile_detailed_enabled_ = false;
+    uint64_t profile_forward_one_calls_ = 0;
+    uint64_t profile_cpu_decode_calls_ = 0;
+    uint64_t profile_cpu_decode_completed_calls_ = 0;
+    double profile_forward_one_ms_ = 0.0;
+    double profile_cpu_decode_enqueue_ms_ = 0.0;
+    double profile_decode_total_ms_ = 0.0;
+    double profile_decode_pre_cpu_ms_ = 0.0;
+    double profile_decode_cpu_ms_ = 0.0;
+    double profile_decode_post_cpu_ms_ = 0.0;
+    std::vector<CpuDecodeParams*> decode_params_;
     friend void cpu_decode_forward_wrapper(void* args);
+    friend void cpu_decode_profile_done_wrapper(void* args);
 
     
 };

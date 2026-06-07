@@ -1,6 +1,8 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 
+import os
+
 import torch
 
 from vllm.config import get_current_vllm_config
@@ -42,8 +44,45 @@ from vllm.model_executor.utils import replace_parameter, set_weight_attrs
 logger = init_logger(__name__)
 
 
+def _parse_layer_set(spec: str) -> set[int]:
+    layers: set[int] = set()
+    for item in spec.split(","):
+        item = item.strip()
+        if not item:
+            continue
+        if "-" in item:
+            start_str, end_str = item.split("-", 1)
+            start = int(start_str)
+            end = int(end_str)
+            if end < start:
+                raise ValueError(
+                    "LVLLM_GPU_RESIDENT_MOE_LAYERS range end must be >= start, "
+                    f"got {item!r}"
+                )
+            layers.update(range(start, end + 1))
+        else:
+            layers.add(int(item))
+    return layers
+
+
+def _gpu_resident_moe_layer(layer: torch.nn.Module) -> bool:
+    spec = os.getenv("LVLLM_GPU_RESIDENT_MOE_LAYERS", "")
+    if not spec:
+        return False
+    layer_id = getattr(layer, "layer_id", None)
+    if layer_id is None:
+        return False
+    try:
+        return int(layer_id) in _parse_layer_set(spec)
+    except ValueError as err:
+        raise ValueError(
+            f"Invalid LVLLM_GPU_RESIDENT_MOE_LAYERS={spec!r}"
+        ) from err
+
+
 def _cpu_offload_enabled(layer: torch.nn.Module) -> bool:
-    return bool(getattr(layer, "use_lk_moe", False))
+    return bool(getattr(layer, "use_lk_moe", False)
+                and not _gpu_resident_moe_layer(layer))
 
 
 def _mxfp4_weight_device(layer: torch.nn.Module) -> torch.device | None:

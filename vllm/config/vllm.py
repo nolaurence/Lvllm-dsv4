@@ -1089,14 +1089,39 @@ class VllmConfig:
                 and os.getenv("LVLLM_ENABLE_MOE_LAYERWISE_LOAD") == "1"
                 and self.compilation_config.cudagraph_mode != CUDAGraphMode.NONE
             ):
-                logger.warning_once(
-                    "lk::MOE CPU layerwise offload is enabled, which executes "
-                    "CPU MoE work and host-to-device copies in decode. CUDA "
-                    "graphs cannot safely capture this path. Overriding "
-                    "cudagraph_mode from %s to NONE.",
-                    self.compilation_config.cudagraph_mode.name,
+                allow_lk_piecewise = (
+                    os.getenv("LVLLM_LK_MOE_ALLOW_PIECEWISE_CUDAGRAPH") == "1"
                 )
-                self.compilation_config.cudagraph_mode = CUDAGraphMode.NONE
+                allow_lk_full = (
+                    os.getenv("LVLLM_LK_MOE_ALLOW_FULL_CUDAGRAPH") == "1"
+                )
+                if allow_lk_full:
+                    logger.warning_once(
+                        "lk::MOE CPU layerwise offload is enabled; keeping "
+                        "experimental cudagraph_mode=%s because "
+                        "LVLLM_LK_MOE_ALLOW_FULL_CUDAGRAPH=1.",
+                        self.compilation_config.cudagraph_mode.name,
+                    )
+                elif allow_lk_piecewise:
+                    logger.warning_once(
+                        "lk::MOE CPU layerwise offload is enabled; using "
+                        "experimental PIECEWISE CUDA graph mode because "
+                        "LVLLM_LK_MOE_ALLOW_PIECEWISE_CUDAGRAPH=1. "
+                        "Overriding cudagraph_mode from %s to PIECEWISE.",
+                        self.compilation_config.cudagraph_mode.name,
+                    )
+                    self.compilation_config.cudagraph_mode = (
+                        CUDAGraphMode.PIECEWISE
+                    )
+                else:
+                    logger.warning_once(
+                        "lk::MOE CPU layerwise offload is enabled, which "
+                        "executes CPU MoE work and host-to-device copies in "
+                        "decode. CUDA graphs cannot safely capture this path. "
+                        "Overriding cudagraph_mode from %s to NONE.",
+                        self.compilation_config.cudagraph_mode.name,
+                    )
+                    self.compilation_config.cudagraph_mode = CUDAGraphMode.NONE
 
             # disable cudagraph when enforce eager execution
             if self.model_config is not None and self.model_config.enforce_eager:
