@@ -4,6 +4,7 @@
 import functools
 import gc
 import itertools
+import os
 import threading
 import time
 from collections import defaultdict
@@ -3910,6 +3911,31 @@ class GPUModelRunner(
                 should_ubatch,
                 num_tokens_across_dp,
             )
+            cg_log_interval = int(
+                os.getenv("LVLLM_LOG_CUDAGRAPH_DISPATCH_INTERVAL", "0") or "0")
+            if cg_log_interval > 0:
+                self._lvllm_cg_dispatch_log_count = (
+                    getattr(self, "_lvllm_cg_dispatch_log_count", 0) + 1)
+                if self._lvllm_cg_dispatch_log_count % cg_log_interval == 0:
+                    logger.info(
+                        "CUDAGraph dispatch step=%d mode=%s uniform_decode=%s "
+                        "max_scheduled_tokens=%d num_tokens=%d padded_tokens=%d "
+                        "num_reqs=%d batch_desc=%s",
+                        self._lvllm_cg_dispatch_log_count,
+                        cudagraph_mode.name,
+                        self._is_uniform_decode(
+                            max_num_scheduled_tokens=max_num_scheduled_tokens,
+                            uniform_decode_query_len=(
+                                self.uniform_decode_query_len),
+                            num_tokens=num_tokens_unpadded,
+                            num_reqs=num_reqs,
+                        ),
+                        max_num_scheduled_tokens,
+                        num_tokens_unpadded,
+                        batch_desc.num_tokens,
+                        num_reqs,
+                        batch_desc,
+                    )
 
             num_tokens_padded = batch_desc.num_tokens
             num_reqs_padded = (
@@ -4030,6 +4056,24 @@ class GPUModelRunner(
         # When spec decode is enabled, defer connector finalization
         # (wait_for_save + clear metadata) until after draft model runs.
         defer_kv_connector_finalize = self.speculative_config is not None
+        profile_decode_stages = (
+            os.getenv("LVLLM_PROFILE_DECODE_STAGES", "0") == "1"
+            and max_num_scheduled_tokens == 1
+        )
+        decode_stage_profile = None
+        if profile_decode_stages:
+            decode_stage_profile = {
+                "mode": cudagraph_mode.name,
+                "num_tokens": num_tokens_unpadded,
+                "padded_tokens": num_tokens_padded,
+                "num_reqs": num_reqs,
+                "wall_start": time.perf_counter(),
+                "forward_start": torch.cuda.Event(enable_timing=True),
+                "forward_end": torch.cuda.Event(enable_timing=True),
+                "post_start": torch.cuda.Event(enable_timing=True),
+                "post_end": torch.cuda.Event(enable_timing=True),
+            }
+            decode_stage_profile["forward_start"].record()
         with (
             set_forward_context(
                 attn_metadata,
@@ -4055,6 +4099,10 @@ class GPUModelRunner(
                 inputs_embeds=inputs_embeds,
                 **model_kwargs,
             )
+
+        if decode_stage_profile is not None:
+            decode_stage_profile["forward_end"].record()
+            decode_stage_profile["post_start"].record()
 
         with record_function_or_nullcontext("gpu_model_runner: postprocess"):
             if self.use_aux_hidden_state_outputs:
@@ -4114,6 +4162,11 @@ class GPUModelRunner(
                 )
                 assert broadcasted is not None
                 logits = broadcasted["logits"]
+
+        if decode_stage_profile is not None:
+            decode_stage_profile["post_end"].record()
+            decode_stage_profile["post_end"].synchronize()
+            self._lvllm_decode_stage_profile_pending = decode_stage_profile
 
         self.execute_model_state = ExecuteModelState(
             scheduler_output,
@@ -4180,8 +4233,56 @@ class GPUModelRunner(
                 scheduler_output, grammar_output, self.input_batch, logits
             )
 
+        decode_stage_profile = getattr(
+            self, "_lvllm_decode_stage_profile_pending", None)
+        if decode_stage_profile is not None:
+            self._lvllm_decode_stage_profile_pending = None
+            decode_stage_profile["sample_start"] = torch.cuda.Event(
+                enable_timing=True)
+            decode_stage_profile["sample_end"] = torch.cuda.Event(
+                enable_timing=True)
+            decode_stage_profile["sample_start"].record()
         with record_function_or_nullcontext("gpu_model_runner: sample"):
             sampler_output = self._sample(logits, spec_decode_metadata)
+        if decode_stage_profile is not None:
+            decode_stage_profile["sample_end"].record()
+            decode_stage_profile["sample_end"].synchronize()
+            self._lvllm_decode_stage_profile_calls = getattr(
+                self, "_lvllm_decode_stage_profile_calls", 0) + 1
+            self._lvllm_decode_stage_profile_forward_ms = getattr(
+                self, "_lvllm_decode_stage_profile_forward_ms", 0.0
+            ) + decode_stage_profile["forward_start"].elapsed_time(
+                decode_stage_profile["forward_end"])
+            self._lvllm_decode_stage_profile_post_ms = getattr(
+                self, "_lvllm_decode_stage_profile_post_ms", 0.0
+            ) + decode_stage_profile["post_start"].elapsed_time(
+                decode_stage_profile["post_end"])
+            self._lvllm_decode_stage_profile_sample_ms = getattr(
+                self, "_lvllm_decode_stage_profile_sample_ms", 0.0
+            ) + decode_stage_profile["sample_start"].elapsed_time(
+                decode_stage_profile["sample_end"])
+            self._lvllm_decode_stage_profile_wall_ms = getattr(
+                self, "_lvllm_decode_stage_profile_wall_ms", 0.0
+            ) + (time.perf_counter() - decode_stage_profile["wall_start"]) * 1000
+            calls = self._lvllm_decode_stage_profile_calls
+            interval = int(os.getenv("LVLLM_PROFILE_DECODE_STAGES_INTERVAL",
+                                     "8") or "8")
+            if calls % max(interval, 1) == 0:
+                logger.info(
+                    "Decode stage profile calls=%d mode=%s num_tokens=%d "
+                    "padded_tokens=%d num_reqs=%d avg_forward_ms=%.3f "
+                    "avg_post_logits_ms=%.3f avg_sample_ms=%.3f "
+                    "avg_wall_ms=%.3f",
+                    calls,
+                    decode_stage_profile["mode"],
+                    decode_stage_profile["num_tokens"],
+                    decode_stage_profile["padded_tokens"],
+                    decode_stage_profile["num_reqs"],
+                    self._lvllm_decode_stage_profile_forward_ms / calls,
+                    self._lvllm_decode_stage_profile_post_ms / calls,
+                    self._lvllm_decode_stage_profile_sample_ms / calls,
+                    self._lvllm_decode_stage_profile_wall_ms / calls,
+                )
 
         self._update_states_after_model_execute(
             sampler_output.sampled_token_ids, scheduler_output

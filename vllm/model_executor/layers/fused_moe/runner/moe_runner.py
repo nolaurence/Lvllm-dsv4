@@ -452,16 +452,20 @@ class MoERunner(MoERunnerInterface):
         )
 
         if getattr(layer, "lk_moe", None) is not None:
+            # LK routed experts run on CPU and block the main stream when the
+            # result is copied back. Start shared experts as soon as the aux
+            # stream has been synced so they can overlap with routing and CPU
+            # expert execution.
+            self._maybe_apply_shared_experts(
+                shared_experts_input,
+                SharedExpertsOrder.MULTI_STREAM_OVERLAPPED,
+            )
             topk_weights, topk_ids = self.router.select_experts(
                 hidden_states=hidden_states,
                 router_logits=router_logits,
                 input_ids=input_ids,
             )
             fused_out = layer.forward_lk(hidden_states, topk_weights, topk_ids)
-            self._maybe_apply_shared_experts(
-                shared_experts_input,
-                SharedExpertsOrder.MULTI_STREAM_OVERLAPPED,
-            )
             return (
                 self._shared_experts.output
                 if self._shared_experts is not None

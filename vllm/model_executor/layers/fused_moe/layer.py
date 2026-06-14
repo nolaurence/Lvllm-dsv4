@@ -65,6 +65,7 @@ import threading
 import ctypes
 import numpy as np
 import os
+import time
 import gc
 
 import vllm
@@ -178,6 +179,23 @@ def _lvllm_moe_stride(hidden_size: int, intermediate_size: int) -> int:
         )
         return 32
     return stride
+
+
+def _lvllm_moe_group_len(name: str, default: int) -> int:
+    raw_value = os.getenv(name)
+    if raw_value is None:
+        return default
+    try:
+        value = int(raw_value)
+    except ValueError:
+        logger.warning("Invalid %s=%s; using default %d.", name, raw_value,
+                       default)
+        return default
+    if value <= 0:
+        logger.warning("Invalid %s=%s; using default %d.", name, raw_value,
+                       default)
+        return default
+    return value
 
 
 
@@ -1125,6 +1143,10 @@ class FusedMoE(PluggableLayer):
     """
 
     # --8<-- [end:fused_moe]
+    _lk_deferred_pending: dict[
+        tuple[int, int],
+        tuple[int, int, int, bool, object, torch.Tensor],
+    ] = {}
 
     def __init__(
         self,
@@ -1190,6 +1212,8 @@ class FusedMoE(PluggableLayer):
         self._lk_gpu_buffers: dict[
             tuple[str, tuple[int, ...], torch.dtype, int], torch.Tensor
         ] = {}
+        self._lk_decode_bridge_logged = False
+        self._lk_deferred_logged = False
 
 
         if params_dtype is None:
@@ -1199,6 +1223,18 @@ class FusedMoE(PluggableLayer):
         vllm_config = get_current_vllm_config()
         self.vllm_config = vllm_config
         self.swiglu_limit = swiglu_limit
+        hf_config = getattr(vllm_config.model_config, "hf_config", None)
+        num_hidden_layers = getattr(hf_config, "num_hidden_layers", None)
+        max_deferred = os.getenv("LVLLM_LK_DEFERRED_EXPERTS")
+        try:
+            max_deferred_experts = int(max_deferred) if max_deferred else 0
+        except ValueError:
+            max_deferred_experts = 0
+        self._lk_max_deferred_experts = max(
+            0, min(max_deferred_experts, top_k))
+        if (num_hidden_layers is not None
+                and self.layer_id == num_hidden_layers - 1):
+            self._lk_max_deferred_experts = 0
 
         # FIXME (varun): We should have a better way of inferring the activation
         # datatype. This works for now as the tensor datatype entering the MoE
@@ -1371,6 +1407,10 @@ class FusedMoE(PluggableLayer):
         self.hash_indices_table = hash_indices_table
         self.apply_router_weight_on_input = apply_router_weight_on_input
         self.activation = MoEActivation.from_str(activation)
+        use_lk_i32_decode_ids = (
+            self.use_lk_moe
+            and os.getenv("LVLLM_DISABLE_LK_CPU_DECODE_BRIDGE", "0") != "1"
+        )
 
         # TODO(bnell): we should not have to create a router if the kernel is
         # monolithic.
@@ -1390,7 +1430,11 @@ class FusedMoE(PluggableLayer):
             enable_eplb=enable_eplb,
             # TODO(bnell): once we can construct the MK at init time, we
             # can make this a value.
-            indices_type_getter=lambda: self.quant_method.topk_indices_dtype,
+            indices_type_getter=(
+                lambda: torch.int32
+                if use_lk_i32_decode_ids
+                else self.quant_method.topk_indices_dtype
+            ),
             zero_expert_type=zero_expert_type,
             num_logical_experts=self.logical_num_experts,
             hash_indices_table=self.hash_indices_table,
@@ -1719,6 +1763,8 @@ class FusedMoE(PluggableLayer):
 
         hidden_ggml_type = self.get_ggml_type_from_dtype(self.moe_config.in_dtype)
         q4_0_type = 2  # GGML_TYPE_Q4_0
+        group_min_len = _lvllm_moe_group_len("LVLLM_MOE_GROUP_MIN_LEN", 2)
+        group_max_len = _lvllm_moe_group_len("LVLLM_MOE_GROUP_MAX_LEN", 1024)
         self.lk_moe_config = vllm._lk_C.MOEConfig(
             self.local_num_experts,
             self.top_k,
@@ -1726,8 +1772,8 @@ class FusedMoE(PluggableLayer):
             self.intermediate_size_per_partition,
             _lvllm_moe_stride(self.hidden_size,
                               self.intermediate_size_per_partition),
-            10,
-            1024,
+            group_min_len,
+            group_max_len,
             self._lk_gate_q4.data_ptr(),
             self._lk_up_q4.data_ptr(),
             self._lk_down_q4.data_ptr(),
@@ -1747,7 +1793,11 @@ class FusedMoE(PluggableLayer):
         if convert_device.type == "cuda":
             torch.cuda.empty_cache()
         logger.debug(
-            "Initialized MXFP4 lk::MOE INT4 weights for layer %s", self.layer_name
+            "Initialized MXFP4 lk::MOE INT4 weights for layer %s "
+            "(group_min_len=%d, group_max_len=%d)",
+            self.layer_name,
+            group_min_len,
+            group_max_len,
         )
 
     @property
@@ -2699,13 +2749,202 @@ class FusedMoE(PluggableLayer):
         qlen = hidden_states.shape[0]
         k = mapped_topk_ids.shape[1]
         hidden_states = hidden_states.contiguous()
-        mapped_topk_ids = mapped_topk_ids.to(dtype=torch.int64).contiguous()
+        use_i32_ids = (mapped_topk_ids.dtype == torch.int32
+                       and hasattr(self.lk_moe, "cpu_decode_i32"))
+        if use_i32_ids:
+            mapped_topk_ids = mapped_topk_ids.contiguous()
+        else:
+            mapped_topk_ids = mapped_topk_ids.to(dtype=torch.int64).contiguous()
         topk_weights = topk_weights.to(dtype=torch.float32).contiguous()
+        active_topk_env = os.getenv("LVLLM_LK_DECODE_ACTIVE_TOPK")
+        if active_topk_env is not None:
+            try:
+                active_topk = int(active_topk_env)
+            except ValueError:
+                active_topk = k
+            active_topk = max(0, min(active_topk, k))
+            if active_topk < k:
+                if not getattr(self, "_lk_decode_active_topk_logged", False):
+                    logger.info(
+                        "lk::MOE decode for layer %s is masking routed "
+                        "experts to active_topk=%d/%d. This is for "
+                        "profiling/deferred-pipeline experiments and changes "
+                        "model outputs.",
+                        self.layer_name,
+                        active_topk,
+                        k,
+                    )
+                    self._lk_decode_active_topk_logged = True
+                keep_mask = torch.zeros_like(mapped_topk_ids, dtype=torch.bool)
+                if active_topk > 0:
+                    keep_pos = torch.topk(topk_weights,
+                                          k=active_topk,
+                                          dim=1,
+                                          largest=True,
+                                          sorted=False).indices
+                    keep_mask.scatter_(1, keep_pos, True)
+                mapped_topk_ids = mapped_topk_ids.masked_fill(~keep_mask, -1)
+                if use_i32_ids:
+                    mapped_topk_ids = mapped_topk_ids.contiguous()
+                else:
+                    mapped_topk_ids = mapped_topk_ids.to(
+                        dtype=torch.int64).contiguous()
+        bypass_mode = os.getenv("LVLLM_LK_DECODE_BYPASS")
+        if bypass_mode:
+            if not getattr(self, "_lk_decode_bypass_logged", False):
+                logger.info(
+                    "lk::MOE decode for layer %s is bypassed with mode=%s. "
+                    "This is for profiling only and changes model outputs.",
+                    self.layer_name,
+                    bypass_mode,
+                )
+                self._lk_decode_bypass_logged = True
+            if bypass_mode == "identity":
+                return hidden_states
+            if bypass_mode == "zero":
+                return torch.zeros_like(hidden_states)
+            if bypass_mode == "empty":
+                return torch.empty_like(hidden_states)
+            raise RuntimeError(
+                "Unsupported LVLLM_LK_DECODE_BYPASS value: "
+                f"{bypass_mode!r}; expected identity, zero, or empty")
+        stream_ptr = torch.cuda.current_stream(hidden_states.device).cuda_stream
         output = self._get_lk_gpu_buffer(
             "output", tuple(hidden_states.shape), hidden_states.dtype,
             hidden_states.device)
-        self.lk_moe.cpu_decode(
-            torch.cuda.current_stream(hidden_states.device).cuda_stream,
+        sync_decode_env = os.getenv("LVLLM_LK_CPU_DECODE_SYNC")
+        use_sync_decode = (
+            (sync_decode_env == "1"
+             or (sync_decode_env is None and self.tp_size > 1))
+            and hasattr(self.lk_moe, "cpu_decode_sync"))
+        if use_sync_decode:
+            decode_fn = (self.lk_moe.cpu_decode_sync_i32 if use_i32_ids
+                         else self.lk_moe.cpu_decode_sync)
+        else:
+            decode_fn = (self.lk_moe.cpu_decode_i32 if use_i32_ids
+                         else self.lk_moe.cpu_decode)
+        if (not self._lk_decode_bridge_logged
+                and os.getenv("LVLLM_LK_LOG_DECODE_BRIDGE", "0") == "1"):
+            logger.info(
+                "lk::MOE decode bridge for layer %s uses %s "
+                "(topk_ids_dtype=%s, expert_map=%s)",
+                self.layer_name,
+                ("cpu_decode_sync_i32" if use_i32_ids
+                 else "cpu_decode_sync") if use_sync_decode else (
+                     "cpu_decode_i32" if use_i32_ids else "cpu_decode"),
+                mapped_topk_ids.dtype,
+                self._expert_map is not None,
+            )
+            self._lk_decode_bridge_logged = True
+        profile_bridge = (
+            os.getenv("LVLLM_LK_PROFILE_PY_BRIDGE", "0") == "1")
+        if profile_bridge:
+            py_bridge_start = time.perf_counter()
+        deferred_enabled = (
+            self._lk_max_deferred_experts > 0
+            and not use_sync_decode
+            and hasattr(self.lk_moe, "cpu_decode_nowait")
+            and hasattr(self.lk_moe, "cpu_decode_wait")
+            and qlen <= int(os.getenv("LVLLM_LK_DEFERRED_MAX_QLEN", "4")))
+        pending_key = (hidden_states.device.index
+                       if hidden_states.device.index is not None
+                       else torch.cuda.current_device(), self.tp_rank)
+        prev_output = None
+        pending = self._lk_deferred_pending.pop(pending_key, None)
+        if pending is not None:
+            (pending_layer, pending_qlen, pending_k, pending_i32,
+             pending_moe, pending_output) = pending
+            if pending_qlen != qlen:
+                raise RuntimeError(
+                    "lk::MOE deferred output shape mismatch: pending qlen="
+                    f"{pending_qlen}, current qlen={qlen}")
+            pending_moe.cpu_decode_wait(
+                stream_ptr,
+                qlen,
+                pending_k,
+                pending_i32,
+                pending_output.data_ptr(),
+            )
+            prev_output = pending_output
+            if pending_layer + 1 != self.layer_id and not self._lk_deferred_logged:
+                logger.warning(
+                    "lk::MOE deferred output from layer %s is merged into "
+                    "layer %s. This can happen with missing/PP-sharded layers.",
+                    pending_layer,
+                    self.layer_id,
+                )
+        if deferred_enabled:
+            deferred_count = min(self._lk_max_deferred_experts, max(k - 1, 0))
+            if deferred_count > 0:
+                protected_k = k - deferred_count
+                keep_pos = torch.topk(
+                    topk_weights,
+                    k=protected_k,
+                    dim=1,
+                    largest=True,
+                    sorted=False,
+                ).indices
+                keep_mask = torch.zeros_like(mapped_topk_ids, dtype=torch.bool)
+                keep_mask.scatter_(1, keep_pos, True)
+                immediate_ids = mapped_topk_ids.masked_fill(
+                    ~keep_mask, -1).contiguous()
+                deferred_ids = mapped_topk_ids.masked_fill(
+                    keep_mask, -1).contiguous()
+                if not use_i32_ids:
+                    immediate_ids = immediate_ids.to(dtype=torch.int64)
+                    deferred_ids = deferred_ids.to(dtype=torch.int64)
+                if not self._lk_deferred_logged:
+                    logger.info(
+                        "lk::MOE deferred decode enabled for layer %s: "
+                        "deferred=%d/%d. This follows ktransformers-style "
+                        "expert deferral and changes model outputs.",
+                        self.layer_name,
+                        deferred_count,
+                        k,
+                    )
+                    self._lk_deferred_logged = True
+                decode_fn(
+                    stream_ptr,
+                    qlen,
+                    k,
+                    immediate_ids.data_ptr(),
+                    topk_weights.data_ptr(),
+                    hidden_states.data_ptr(),
+                    output.data_ptr(),
+                )
+                if prev_output is not None:
+                    output = output + prev_output
+                deferred_output = self._get_lk_gpu_buffer(
+                    f"deferred_output_{self.layer_id}",
+                    tuple(hidden_states.shape),
+                    hidden_states.dtype,
+                    hidden_states.device,
+                )
+                deferred_nowait = (
+                    self.lk_moe.cpu_decode_nowait_i32
+                    if use_i32_ids
+                    else self.lk_moe.cpu_decode_nowait
+                )
+                deferred_nowait(
+                    stream_ptr,
+                    qlen,
+                    k,
+                    deferred_ids.data_ptr(),
+                    topk_weights.data_ptr(),
+                    hidden_states.data_ptr(),
+                    deferred_output.data_ptr(),
+                )
+                self._lk_deferred_pending[pending_key] = (
+                    self.layer_id,
+                    qlen,
+                    k,
+                    use_i32_ids,
+                    self.lk_moe,
+                    deferred_output,
+                )
+                return output
+        decode_fn(
+            stream_ptr,
             qlen,
             k,
             mapped_topk_ids.data_ptr(),
@@ -2713,6 +2952,26 @@ class FusedMoE(PluggableLayer):
             hidden_states.data_ptr(),
             output.data_ptr(),
         )
+        if prev_output is not None:
+            output = output + prev_output
+        if profile_bridge:
+            py_bridge_elapsed_ms = (time.perf_counter() -
+                                    py_bridge_start) * 1000
+            self._lk_py_bridge_calls = getattr(
+                self, "_lk_py_bridge_calls", 0) + 1
+            self._lk_py_bridge_ms = getattr(
+                self, "_lk_py_bridge_ms", 0.0) + py_bridge_elapsed_ms
+            if self._lk_py_bridge_calls % 32 == 0:
+                logger.info(
+                    "lk::MOE Python bridge for layer %s calls=%d "
+                    "avg_enqueue_ms=%.4f qlen=%d k=%d ids=%s",
+                    self.layer_name,
+                    self._lk_py_bridge_calls,
+                    self._lk_py_bridge_ms / self._lk_py_bridge_calls,
+                    qlen,
+                    k,
+                    "i32" if use_i32_ids else "i64",
+                )
         return output
 
     def forward_lk(
@@ -2726,8 +2985,8 @@ class FusedMoE(PluggableLayer):
         qlen = hidden_states.shape[0]
         k = topk_ids.shape[1]
 
-        topk_ids_i64 = topk_ids.to(torch.int64)
         if self._expert_map is not None:
+            topk_ids_i64 = topk_ids.to(torch.int64)
             if torch.any((topk_ids_i64 < 0)
                          | (topk_ids_i64 >= self._expert_map.numel())):
                 invalid = topk_ids_i64[
@@ -2742,7 +3001,7 @@ class FusedMoE(PluggableLayer):
                 device=topk_ids.device, dtype=torch.int64
             )[topk_ids_i64]
         else:
-            mapped_topk_ids = topk_ids_i64
+            mapped_topk_ids = topk_ids
 
         if (hidden_states.is_cuda
                 and os.getenv("LVLLM_DISABLE_LK_CPU_DECODE_BRIDGE", "0") != "1"

@@ -180,8 +180,19 @@ class Worker(WorkerBase):
 
         split_enabled = os.getenv("LVLLM_SPLIT_LK_THREADS", "1").lower()
         if split_enabled not in ("1", "true", "yes", "on"):
+            logger.info(
+                "LVLLM_SPLIT_LK_THREADS=%s; keeping LK_THREADS=%s, "
+                "LK_CPU_OFFSET=%s, LK_CALLBACK_CPU=%s for local worker rank %d.",
+                split_enabled,
+                os.getenv("LK_THREADS"),
+                os.getenv("LK_CPU_OFFSET"),
+                os.getenv("LK_CALLBACK_CPU"),
+                self.local_rank,
+            )
             return
 
+        per_worker_threads = _parse_positive_int_env(
+            "LVLLM_LK_THREADS_PER_WORKER")
         total_threads = _parse_positive_int_env("LVLLM_LK_THREADS_TOTAL")
         source_env = "LVLLM_LK_THREADS_TOTAL"
         if total_threads is None:
@@ -190,35 +201,80 @@ class Worker(WorkerBase):
         if total_threads is None:
             total_threads = _parse_positive_int_env("LK_THREADS")
             source_env = "LK_THREADS"
-        if total_threads is None:
+        if total_threads is None and per_worker_threads is None:
             return
 
         local_world_size = max(1, self.parallel_config.local_world_size)
         worker_local_rank = self.local_rank % local_world_size
-        base_threads = total_threads // local_world_size
-        extra_threads = total_threads % local_world_size
-        worker_threads = base_threads + int(worker_local_rank < extra_threads)
-        worker_threads = max(1, worker_threads)
-        worker_cpu_offset = base_threads * worker_local_rank + min(
-            worker_local_rank, extra_threads
-        )
+        if per_worker_threads is not None:
+            worker_threads = per_worker_threads
+            worker_cpu_offset = (
+                (per_worker_threads + 1) * worker_local_rank
+            )
+            source_env = "LVLLM_LK_THREADS_PER_WORKER"
+            source_value = per_worker_threads
+        else:
+            assert total_threads is not None
+            base_threads = total_threads // local_world_size
+            extra_threads = total_threads % local_world_size
+            worker_threads = base_threads + int(worker_local_rank < extra_threads)
+            worker_threads = max(1, worker_threads)
+            worker_cpu_offset = base_threads * worker_local_rank + min(
+                worker_local_rank, extra_threads
+            )
+            source_value = total_threads
+            if source_env == "LK_THREADS":
+                available_cpus = len(os.sched_getaffinity(0))
+                if (worker_local_rank == 0
+                        and total_threads < available_cpus
+                        and local_world_size > 1):
+                    logger.warning(
+                        "LK_THREADS=%d is treated as the total LK thread "
+                        "budget and will be split across %d local workers "
+                        "(~%d threads/worker), leaving %d available CPUs "
+                        "unused. For this host, consider setting "
+                        "LVLLM_LK_THREADS_TOTAL=%d or "
+                        "LVLLM_LK_THREADS_PER_WORKER=%d.",
+                        total_threads,
+                        local_world_size,
+                        worker_threads,
+                        available_cpus - total_threads,
+                        available_cpus,
+                        max(1, available_cpus // local_world_size),
+                    )
+        callback_cpu = _parse_positive_int_env("LVLLM_LK_CALLBACK_CPU")
+        if callback_cpu is None:
+            callback_cpu_base = _parse_positive_int_env(
+                "LVLLM_LK_CALLBACK_CPU_BASE")
+            if callback_cpu_base is None:
+                callback_cpu = worker_cpu_offset + worker_threads
+            else:
+                callback_cpu = callback_cpu_base + worker_local_rank
+        available_cpus = sorted(os.sched_getaffinity(0))
+        if callback_cpu not in available_cpus:
+            callback_cpu = available_cpus[
+                min(len(available_cpus) - 1,
+                    worker_cpu_offset + worker_threads - 1)
+            ]
 
         os.environ["LK_THREADS"] = str(worker_threads)
         os.environ["LK_CPU_OFFSET"] = str(worker_cpu_offset)
+        os.environ["LK_CALLBACK_CPU"] = str(callback_cpu)
         os.environ["OMP_NUM_THREADS"] = str(worker_threads)
         os.environ.setdefault("MKL_NUM_THREADS", str(worker_threads))
         torch.set_num_threads(worker_threads)
         logger.info(
             "Configured LK_THREADS=%d, LK_CPU_OFFSET=%d, and "
-            "OMP_NUM_THREADS=%d for local worker "
+            "LK_CALLBACK_CPU=%d, and OMP_NUM_THREADS=%d for local worker "
             "rank %d/%d from %s=%d.",
             worker_threads,
             worker_cpu_offset,
+            callback_cpu,
             worker_threads,
             worker_local_rank,
             local_world_size,
             source_env,
-            total_threads,
+            source_value,
         )
 
     def sleep(self, level: int = 1) -> None:

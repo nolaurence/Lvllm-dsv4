@@ -1095,7 +1095,33 @@ class VllmConfig:
                 allow_lk_full = (
                     os.getenv("LVLLM_LK_MOE_ALLOW_FULL_CUDAGRAPH") == "1"
                 )
-                if allow_lk_full:
+                lk_decode_only = (
+                    os.getenv("LVLLM_LK_MOE_CUDAGRAPH_DECODE_ONLY") == "1"
+                )
+                lk_sync_decode_env = os.getenv("LVLLM_LK_CPU_DECODE_SYNC")
+                lk_sync_decode = (
+                    lk_sync_decode_env == "1"
+                    or (lk_sync_decode_env is None
+                        and self.parallel_config.tensor_parallel_size > 1)
+                )
+                if lk_sync_decode:
+                    logger.warning_once(
+                        "lk::MOE CPU layerwise offload is using synchronous "
+                        "CPU decode bridge because %s. FULL CUDA graph decode "
+                        "cannot capture this path safely, and PIECEWISE capture "
+                        "still reaches the synchronous CPU bridge; overriding "
+                        "cudagraph_mode from %s to NONE. Set "
+                        "LVLLM_LK_CPU_DECODE_SYNC=0 to restore callback-based "
+                        "decode.",
+                        "LVLLM_LK_CPU_DECODE_SYNC=1"
+                        if lk_sync_decode_env == "1"
+                        else "tensor_parallel_size > 1",
+                        self.compilation_config.cudagraph_mode.name,
+                    )
+                    self.compilation_config.cudagraph_mode = (
+                        CUDAGraphMode.NONE
+                    )
+                elif allow_lk_full:
                     logger.warning_once(
                         "lk::MOE CPU layerwise offload is enabled; keeping "
                         "experimental cudagraph_mode=%s because "
@@ -1113,15 +1139,66 @@ class VllmConfig:
                     self.compilation_config.cudagraph_mode = (
                         CUDAGraphMode.PIECEWISE
                     )
+                elif lk_decode_only:
+                    logger.warning_once(
+                        "lk::MOE CPU layerwise offload is enabled; using "
+                        "FULL_DECODE_ONLY CUDA graph mode because "
+                        "LVLLM_LK_MOE_CUDAGRAPH_DECODE_ONLY=1. Mixed/prefill "
+                        "batches will run without CUDA graphs. Overriding "
+                        "cudagraph_mode from %s to FULL_DECODE_ONLY.",
+                        self.compilation_config.cudagraph_mode.name,
+                    )
+                    self.compilation_config.cudagraph_mode = (
+                        CUDAGraphMode.FULL_DECODE_ONLY
+                    )
                 else:
                     logger.warning_once(
                         "lk::MOE CPU layerwise offload is enabled, which "
-                        "executes CPU MoE work and host-to-device copies in "
-                        "decode. CUDA graphs cannot safely capture this path. "
-                        "Overriding cudagraph_mode from %s to NONE.",
+                        "executes CPU MoE work and host-to-device copies in decode. "
+                        "Using experimental FULL_AND_PIECEWISE CUDA graph mode: "
+                        "decode batches use FULL graphs and mixed/prefill batches "
+                        "use PIECEWISE graphs. Overriding cudagraph_mode from %s "
+                        "to FULL_AND_PIECEWISE.",
                         self.compilation_config.cudagraph_mode.name,
                     )
-                    self.compilation_config.cudagraph_mode = CUDAGraphMode.NONE
+                    self.compilation_config.cudagraph_mode = (
+                        CUDAGraphMode.FULL_AND_PIECEWISE
+                    )
+                lk_max_cg_size = os.getenv(
+                    "LVLLM_LK_MOE_MAX_CUDAGRAPH_CAPTURE_SIZE")
+                if (lk_max_cg_size is not None
+                        and self.compilation_config.max_cudagraph_capture_size
+                        is None
+                        and self.compilation_config.cudagraph_capture_sizes
+                        is None):
+                    try:
+                        lk_max_cg_size_int = int(lk_max_cg_size)
+                    except ValueError:
+                        logger.warning(
+                            "Ignoring invalid "
+                            "LVLLM_LK_MOE_MAX_CUDAGRAPH_CAPTURE_SIZE=%s.",
+                            lk_max_cg_size,
+                        )
+                    else:
+                        if lk_max_cg_size_int > 0:
+                            logger.warning_once(
+                                "lk::MOE CPU layerwise offload is enabled; "
+                                "setting max_cudagraph_capture_size=%d from "
+                                "LVLLM_LK_MOE_MAX_CUDAGRAPH_CAPTURE_SIZE. "
+                                "This only expands small decode/mixed CUDA "
+                                "graph capture sizes; large prefill batches "
+                                "still run eager when they exceed the max.",
+                                lk_max_cg_size_int,
+                            )
+                            self.compilation_config.max_cudagraph_capture_size = (
+                                lk_max_cg_size_int
+                            )
+                        else:
+                            logger.warning(
+                                "Ignoring non-positive "
+                                "LVLLM_LK_MOE_MAX_CUDAGRAPH_CAPTURE_SIZE=%s.",
+                                lk_max_cg_size,
+                            )
 
             # disable cudagraph when enforce eager execution
             if self.model_config is not None and self.model_config.enforce_eager:
