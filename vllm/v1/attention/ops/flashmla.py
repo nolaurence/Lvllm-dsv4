@@ -4,7 +4,6 @@
 
 import dataclasses
 import os
-from typing import Optional
 
 import torch
 
@@ -77,7 +76,7 @@ def is_flashmla_sparse_supported() -> tuple[bool, str | None]:
     ):
         return (
             False,
-            "FlashMLA Sparse is only supported on Hopper and Blackwell devices.",
+            "FlashMLA Sparse is only supported on Hopper and Blackwell DC devices.",
         )
     return True, None
 
@@ -187,21 +186,21 @@ else:
     def flash_mla_with_kvcache(  # type: ignore[no-redef]
         q: torch.Tensor,
         k_cache: torch.Tensor,
-        block_table: Optional[torch.Tensor],
-        cache_seqlens: Optional[torch.Tensor],
+        block_table: torch.Tensor | None,
+        cache_seqlens: torch.Tensor | None,
         head_dim_v: int,
         tile_scheduler_metadata: FlashMLASchedMeta,
         num_splits: None = None,
-        softmax_scale: Optional[float] = None,
+        softmax_scale: float | None = None,
         causal: bool = False,
         is_fp8_kvcache: bool = False,
-        indices: Optional[torch.Tensor] = None,
-        attn_sink: Optional[torch.Tensor] = None,
-        extra_k_cache: Optional[torch.Tensor] = None,
-        extra_indices_in_kvcache: Optional[torch.Tensor] = None,
-        topk_length: Optional[torch.Tensor] = None,
-        extra_topk_length: Optional[torch.Tensor] = None,
-        out: Optional[torch.Tensor] = None,
+        indices: torch.Tensor | None = None,
+        attn_sink: torch.Tensor | None = None,
+        extra_k_cache: torch.Tensor | None = None,
+        extra_indices_in_kvcache: torch.Tensor | None = None,
+        topk_length: torch.Tensor | None = None,
+        extra_topk_length: torch.Tensor | None = None,
+        out: torch.Tensor | None = None,
     ) -> tuple[torch.Tensor, torch.Tensor]:
         if not _use_sm86_flashmla_reference() or indices is None:
             _raise_flashmla_unavailable()
@@ -263,9 +262,7 @@ else:
                         extra_offsets = torch.arange(
                             extra_idx.shape[0], device=extra_idx.device
                         )
-                        mask_extra = mask_extra & (
-                            extra_offsets < extra_topk_length[b]
-                        )
+                        mask_extra = mask_extra & (extra_offsets < extra_topk_length[b])
                     k_all = torch.cat([k_main, k_extra], dim=0)
                     mask = torch.cat([mask_main, mask_extra], dim=0)
                 else:
@@ -291,9 +288,9 @@ else:
                     denom = denom + (sink.view(heads, 1) - max_logit).exp()
                 probs = (exp_logits / denom).to(torch.bfloat16)
                 out_view[b, s].copy_((probs @ k_all[:, :head_dim_v]).to(out.dtype))
-                lse[b, :, s] = (
-                    max_logit.squeeze(-1) + denom.squeeze(-1).log()
-                ).to(torch.float32)
+                lse[b, :, s] = (max_logit.squeeze(-1) + denom.squeeze(-1).log()).to(
+                    torch.float32
+                )
         return out, lse
 
     def flash_mla_sparse_fwd(  # type: ignore[no-redef]
@@ -302,9 +299,9 @@ else:
         indices: torch.Tensor,
         sm_scale: float,
         d_v: int = 512,
-        attn_sink: Optional[torch.Tensor] = None,
-        topk_length: Optional[torch.Tensor] = None,
-        out: Optional[torch.Tensor] = None,
+        attn_sink: torch.Tensor | None = None,
+        topk_length: torch.Tensor | None = None,
+        out: torch.Tensor | None = None,
     ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
         if not _use_sm86_flashmla_reference():
             _raise_flashmla_unavailable()
@@ -340,9 +337,7 @@ else:
             probs = (exp_logits / denom).to(torch.bfloat16)
             out[t].copy_((probs @ k_all[:, :d_v]).to(out.dtype))
             max_logits[t] = max_logit.squeeze(-1)
-            lse[t] = (max_logit.squeeze(-1) + denom.squeeze(-1).log()).to(
-                torch.float32
-            )
+            lse[t] = (max_logit.squeeze(-1) + denom.squeeze(-1).log()).to(torch.float32)
         return out, max_logits, lse
 
 
