@@ -14,6 +14,9 @@ from vllm.model_executor.layers.fused_moe import (
     SharedExperts,
 )
 from vllm.model_executor.layers.fused_moe import modular_kernel as mk
+from vllm.model_executor.layers.fused_moe.config import (
+    mxfp4_w4a16_moe_quant_config,
+)
 from vllm.model_executor.layers.fused_moe.oracle.mxfp4 import (
     TRITON_BACKENDS,
     Mxfp4MoeBackend,
@@ -36,6 +39,7 @@ from vllm.model_executor.model_loader.reload.layerwise import (
     initialize_online_processing,
 )
 from vllm.model_executor.utils import replace_parameter, set_weight_attrs
+from vllm.platforms import current_platform
 
 logger = init_logger(__name__)
 
@@ -82,8 +86,11 @@ class Mxfp4Config(QuantizationConfig):
     def get_config_filenames(cls) -> list[str]:
         return []
 
-    # TODO (zyongye) This is only temporaty fallback.
-    # We should have `Mxfp4MoEMethod` after this migration is complete.
+    def _make_moe_method(self, moe: FusedMoEConfig) -> FusedMoEMethodBase:
+        """MoE method for RoutedExperts. Subclasses override to pick a
+        checkpoint-specific kernel family."""
+        return Mxfp4MoEMethod(moe)
+
     def get_quant_method(
         self, layer: torch.nn.Module, prefix: str
     ) -> "QuantizeMethodBase | None":
@@ -100,17 +107,13 @@ class Mxfp4Config(QuantizationConfig):
             )
             return UnquantizedLinearMethod()
         elif isinstance(layer, RoutedExperts):
-            return GptOssMxfp4MoEMethod(layer.moe_config)
+            return self._make_moe_method(layer.moe_config)
         elif isinstance(layer, Attention):
             logger.debug_once(
                 "MXFP4 attention layer is not implemented. "
                 "Skipping quantization for this layer.",
             )
         return None
-
-    def is_mxfp4_quant(self, prefix: str, layer: torch.nn.Module) -> bool:
-        """MXFP4 config always uses MXFP4 quantization."""
-        return True
 
 
 class GptOssMxfp4Config(Mxfp4Config):
@@ -144,6 +147,9 @@ class GptOssMxfp4Config(Mxfp4Config):
         if model_type != "gpt_oss":
             return None
         return "gpt_oss_mxfp4"
+
+    def _make_moe_method(self, moe: FusedMoEConfig) -> FusedMoEMethodBase:
+        return GptOssMxfp4MoEMethod(moe)
 
 
 class GptOssMxfp4MoEMethod(FusedMoEMethodBase):
@@ -220,7 +226,7 @@ class GptOssMxfp4MoEMethod(FusedMoEMethodBase):
         w13_weight = torch.nn.Parameter(
             torch.zeros(
                 num_experts,
-                2 * intermediate_size_per_partition,
+                self.moe.w13_num_shards * intermediate_size_per_partition,
                 hidden_size // 2,
                 dtype=weight_dtype,
                 device=device,
@@ -233,7 +239,7 @@ class GptOssMxfp4MoEMethod(FusedMoEMethodBase):
         w13_weight_scale = torch.nn.Parameter(
             torch.zeros(
                 num_experts,
-                2 * intermediate_size_per_partition,
+                self.moe.w13_num_shards * intermediate_size_per_partition,
                 hidden_size // mxfp4_block,
                 dtype=scale_dtype,
                 device=device,
@@ -276,7 +282,7 @@ class GptOssMxfp4MoEMethod(FusedMoEMethodBase):
             w13_bias = torch.nn.Parameter(
                 torch.zeros(
                     num_experts,
-                    2 * intermediate_size_per_partition,
+                    self.moe.w13_num_shards * intermediate_size_per_partition,
                     dtype=torch.bfloat16,
                     device=device,
                 ),
@@ -319,13 +325,13 @@ class GptOssMxfp4MoEMethod(FusedMoEMethodBase):
         assert (
             w13.dim() == 3
             and w13.shape[0] == num_experts
-            and w13.shape[1] == intermediate_size * 2
+            and w13.shape[1] == intermediate_size * self.moe.w13_num_shards
             and w13.shape[2] == hidden_size // 2
         )
         assert (
             w13_scale.dim() == 3
             and w13_scale.shape[0] == num_experts
-            and w13_scale.shape[1] == intermediate_size * 2
+            and w13_scale.shape[1] == intermediate_size * self.moe.w13_num_shards
             and w13_scale.shape[2] == hidden_size // sf_block_size
         )
         assert (
@@ -343,7 +349,7 @@ class GptOssMxfp4MoEMethod(FusedMoEMethodBase):
             assert (
                 w13_bias.dim() == 2
                 and w13_bias.shape[0] == num_experts
-                and w13_bias.shape[1] == intermediate_size * 2
+                and w13_bias.shape[1] == intermediate_size * self.moe.w13_num_shards
             )
         if w2_bias is not None:
             assert (
@@ -380,11 +386,6 @@ class GptOssMxfp4MoEMethod(FusedMoEMethodBase):
             self.w13_precision_config = w13_scale
             self.w2_precision_config = w2_scale
 
-        # AITER backend requires weights to be marked as shuffled.
-        if self.mxfp4_backend == Mxfp4MoeBackend.AITER_MXFP4_BF16:
-            layer.w13_weight.is_shuffled = True
-            layer.w2_weight.is_shuffled = True
-
         if w13_bias is not None and w2_bias is not None:
             replace_parameter(layer, "w13_bias", w13_bias)
             replace_parameter(layer, "w2_bias", w2_bias)
@@ -400,7 +401,6 @@ class GptOssMxfp4MoEMethod(FusedMoEMethodBase):
                 mxfp4_backend=self.mxfp4_backend,
                 experts_cls=self.experts_cls,
                 routing_tables=layer._expert_routing_tables(),
-                layer=layer,
             )
 
     def process_weights_after_loading(self, layer: RoutedExperts) -> None:
@@ -453,16 +453,6 @@ class GptOssMxfp4MoEMethod(FusedMoEMethodBase):
             layer=layer,
         )
 
-    def select_gemm_impl(
-        self,
-        prepare_finalize: mk.FusedMoEPrepareAndFinalize,
-        layer: RoutedExperts,
-    ) -> mk.FusedMoEExpertsModular:
-        raise ValueError(
-            f"{self.__class__.__name__} uses the new modular kernel "
-            "initialization logic. This function should not be called."
-        )
-
     def apply(
         self,
         layer: RoutedExperts,
@@ -506,6 +496,10 @@ class GptOssMxfp4MoEMethod(FusedMoEMethodBase):
             global_num_experts=layer.global_num_experts,
             expert_map=layer.expert_map,
             apply_router_weight_on_input=layer.apply_router_weight_on_input,
+            num_expert_group=layer.num_expert_group,
+            topk_group=layer.topk_group,
+            e_score_correction_bias=layer.e_score_correction_bias,
+            routed_scaling_factor=layer.routed_scaling_factor,
         )
 
 
@@ -514,6 +508,7 @@ class Mxfp4MoEMethod(FusedMoEMethodBase):
 
     def __init__(self, moe: FusedMoEConfig):
         super().__init__(moe)
+
         self.weight_dtype = "mxfp4"
         self.mxfp4_backend, self.experts_cls = select_deepseek_v4_mxfp4_moe_backend(moe)
 
@@ -558,8 +553,43 @@ class Mxfp4MoEMethod(FusedMoEMethodBase):
             moe_parallel_config=moe_parallel_config,
         )
         return mxfp4_round_up_hidden_size_and_intermediate_size(
-            self.mxfp4_backend, hidden_size, intermediate_size_per_partition
+            self.mxfp4_backend,
+            hidden_size,
+            intermediate_size_per_partition,
+            activation=self.moe.activation,
         )
+
+    @staticmethod
+    def _encode_mxfp4_weight_scale(loaded_weight: torch.Tensor) -> torch.Tensor:
+        if loaded_weight.dtype == torch.uint8:
+            return loaded_weight
+        if loaded_weight.dtype == torch.float8_e8m0fnu:
+            return loaded_weight.view(torch.uint8)
+        if loaded_weight.is_floating_point():
+            return loaded_weight.to(torch.float8_e8m0fnu).view(torch.uint8)
+        return loaded_weight
+
+    @staticmethod
+    def get_scale_weight_loader(weight_loader):
+        def mxfp4_weight_loader(
+            param: torch.nn.Parameter,
+            loaded_weight: torch.Tensor,
+            weight_name: str,
+            shard_id: str,
+            expert_id: int,
+            return_success: bool = False,
+        ) -> bool | None:
+            loaded_weight = Mxfp4MoEMethod._encode_mxfp4_weight_scale(loaded_weight)
+            return weight_loader(
+                param,
+                loaded_weight,
+                weight_name,
+                shard_id,
+                expert_id,
+                return_success=return_success,
+            )
+
+        return mxfp4_weight_loader
 
     def create_weights(
         self,
@@ -582,12 +612,14 @@ class Mxfp4MoEMethod(FusedMoEMethodBase):
         device = _mxfp4_weight_device(layer)
         if device is not None:
             self.uses_meta_device = True
+        weight_loader = extra_weight_attrs.pop("weight_loader")
+        scale_weight_loader = Mxfp4MoEMethod.get_scale_weight_loader(weight_loader)
 
         # Fused gate_up_proj (column parallel)
         w13_weight = torch.nn.Parameter(
             torch.zeros(
                 num_experts,
-                2 * intermediate_size_per_partition,
+                self.moe.w13_num_shards * intermediate_size_per_partition,
                 hidden_size // 2,
                 dtype=weight_dtype,
                 device=device,
@@ -596,11 +628,12 @@ class Mxfp4MoEMethod(FusedMoEMethodBase):
         )
         layer.register_parameter("w13_weight", w13_weight)
         set_weight_attrs(w13_weight, extra_weight_attrs)
+        set_weight_attrs(w13_weight, {"weight_loader": weight_loader})
 
         w13_weight_scale = torch.nn.Parameter(
             torch.zeros(
                 num_experts,
-                2 * intermediate_size_per_partition,
+                self.moe.w13_num_shards * intermediate_size_per_partition,
                 hidden_size // mxfp4_block,
                 dtype=scale_dtype,
                 device=device,
@@ -609,6 +642,7 @@ class Mxfp4MoEMethod(FusedMoEMethodBase):
         )
         layer.register_parameter("w13_weight_scale", w13_weight_scale)
         set_weight_attrs(w13_weight_scale, extra_weight_attrs)
+        set_weight_attrs(w13_weight_scale, {"weight_loader": scale_weight_loader})
         w13_weight_scale.quant_method = "block"
 
         # down_proj (row parallel)
@@ -624,6 +658,7 @@ class Mxfp4MoEMethod(FusedMoEMethodBase):
         )
         layer.register_parameter("w2_weight", w2_weight)
         set_weight_attrs(w2_weight, extra_weight_attrs)
+        set_weight_attrs(w2_weight, {"weight_loader": weight_loader})
 
         w2_weight_scale = torch.nn.Parameter(
             torch.zeros(
@@ -637,13 +672,14 @@ class Mxfp4MoEMethod(FusedMoEMethodBase):
         )
         layer.register_parameter("w2_weight_scale", w2_weight_scale)
         set_weight_attrs(w2_weight_scale, extra_weight_attrs)
+        set_weight_attrs(w2_weight_scale, {"weight_loader": scale_weight_loader})
         w2_weight_scale.quant_method = "block"
 
         if self.moe.has_bias:
             w13_bias = torch.nn.Parameter(
                 torch.zeros(
                     num_experts,
-                    2 * intermediate_size_per_partition,
+                    self.moe.w13_num_shards * intermediate_size_per_partition,
                     dtype=torch.bfloat16,
                     device=device,
                 ),
@@ -651,6 +687,7 @@ class Mxfp4MoEMethod(FusedMoEMethodBase):
             )
             layer.register_parameter("w13_bias", w13_bias)
             set_weight_attrs(w13_bias, extra_weight_attrs)
+            set_weight_attrs(w13_bias, {"weight_loader": weight_loader})
 
             w2_bias = torch.nn.Parameter(
                 torch.zeros(
@@ -663,6 +700,7 @@ class Mxfp4MoEMethod(FusedMoEMethodBase):
             )
             layer.register_parameter("w2_bias", w2_bias)
             set_weight_attrs(w2_bias, extra_weight_attrs)
+            set_weight_attrs(w2_bias, {"weight_loader": weight_loader})
 
         if _cpu_offload_enabled(layer):
             initialize_online_processing(layer)
@@ -682,42 +720,46 @@ class Mxfp4MoEMethod(FusedMoEMethodBase):
         hidden_size = self.hidden_size
         sf_block_size = 32
 
-        # Shape assertions
-        assert (
-            w13.dim() == 3
-            and w13.shape[0] == num_experts
-            and w13.shape[1] == intermediate_size * 2
-            and w13.shape[2] == hidden_size // 2
-        )
-        assert (
-            w13_scale.dim() == 3
-            and w13_scale.shape[0] == num_experts
-            and w13_scale.shape[1] == intermediate_size * 2
-            and w13_scale.shape[2] == hidden_size // sf_block_size
-        )
-        assert (
-            w2.dim() == 3
-            and w2.shape[0] == num_experts
-            and w2.shape[1] == hidden_size
-            and w2.shape[2] == intermediate_size // 2
-        )
-        assert (
-            w2_scale.dim() == 3
-            and w2_scale.shape[1] == hidden_size
-            and w2_scale.shape[2] == intermediate_size // sf_block_size
-        )
-        if w13_bias is not None:
+        # Shape assertions — skipped for SITU since its kernel handles native
+        # (non-256-aligned) intermediate sizes without prior round-up.
+        from vllm.model_executor.layers.fused_moe.activation import MoEActivation
+
+        if self.moe.activation != MoEActivation.SITU:
             assert (
-                w13_bias.dim() == 2
-                and w13_bias.shape[0] == num_experts
-                and w13_bias.shape[1] == intermediate_size * 2
+                w13.dim() == 3
+                and w13.shape[0] == num_experts
+                and w13.shape[1] == intermediate_size * self.moe.w13_num_shards
+                and w13.shape[2] == hidden_size // 2
             )
-        if w2_bias is not None:
             assert (
-                w2_bias.dim() == 2
-                and w2_bias.shape[0] == num_experts
-                and w2_bias.shape[1] == hidden_size
+                w13_scale.dim() == 3
+                and w13_scale.shape[0] == num_experts
+                and w13_scale.shape[1] == intermediate_size * self.moe.w13_num_shards
+                and w13_scale.shape[2] == hidden_size // sf_block_size
             )
+            assert (
+                w2.dim() == 3
+                and w2.shape[0] == num_experts
+                and w2.shape[1] == hidden_size
+                and w2.shape[2] == intermediate_size // 2
+            )
+            assert (
+                w2_scale.dim() == 3
+                and w2_scale.shape[1] == hidden_size
+                and w2_scale.shape[2] == intermediate_size // sf_block_size
+            )
+            if w13_bias is not None:
+                assert (
+                    w13_bias.dim() == 2
+                    and w13_bias.shape[0] == num_experts
+                    and w13_bias.shape[1] == intermediate_size * self.moe.w13_num_shards
+                )
+            if w2_bias is not None:
+                assert (
+                    w2_bias.dim() == 2
+                    and w2_bias.shape[0] == num_experts
+                    and w2_bias.shape[1] == hidden_size
+                )
 
         # Convert weights to kernel format
         w13, w2, w13_scale, w2_scale, w13_bias, w2_bias = (
@@ -731,12 +773,22 @@ class Mxfp4MoEMethod(FusedMoEMethodBase):
                 w13_bias=w13_bias,
                 w2_bias=w2_bias,
                 _cache_permute_indices=self._cache_permute_indices,
+                activation=self.moe.activation,
             )
         )
 
         # For TRITON backends, weights are wrapped tensors from triton_kernels
         # that don't support .detach(). Manually assign parameters.
-        if self.mxfp4_backend not in TRITON_BACKENDS:
+        is_gfx1250 = False
+        if current_platform.is_rocm():
+            from vllm.platforms.rocm import on_gfx1250
+
+            is_gfx1250 = on_gfx1250()
+
+        uses_triton_weight_format = self.mxfp4_backend in TRITON_BACKENDS or (
+            self.mxfp4_backend == Mxfp4MoeBackend.AITER_MXFP4_BF16 and is_gfx1250
+        )
+        if not uses_triton_weight_format:
             replace_parameter(layer, "w13_weight", w13)
             replace_parameter(layer, "w2_weight", w2)
             replace_parameter(layer, "w13_weight_scale", w13_scale)
@@ -746,11 +798,6 @@ class Mxfp4MoEMethod(FusedMoEMethodBase):
             layer.w2_weight = w2
             self.w13_precision_config = w13_scale
             self.w2_precision_config = w2_scale
-
-        # AITER backend requires weights to be marked as shuffled.
-        if self.mxfp4_backend == Mxfp4MoeBackend.AITER_MXFP4_BF16:
-            layer.w13_weight.is_shuffled = True
-            layer.w2_weight.is_shuffled = True
 
         if w13_bias is not None and w2_bias is not None:
             replace_parameter(layer, "w13_bias", w13_bias)
@@ -767,7 +814,6 @@ class Mxfp4MoEMethod(FusedMoEMethodBase):
                 mxfp4_backend=self.mxfp4_backend,
                 experts_cls=self.experts_cls,
                 routing_tables=layer._expert_routing_tables(),
-                layer=layer,
             )
 
     def process_weights_after_loading(self, layer):
@@ -799,7 +845,15 @@ class Mxfp4MoEMethod(FusedMoEMethodBase):
         w2_bias = getattr(layer, "w2_bias", None)
         swiglu_limit = getattr(layer, "swiglu_limit", None)
 
-        if self.mxfp4_backend in TRITON_BACKENDS:
+        is_gfx1250 = False
+        if current_platform.is_rocm():
+            from vllm.platforms.rocm import on_gfx1250
+
+            is_gfx1250 = on_gfx1250()
+
+        if self.mxfp4_backend in TRITON_BACKENDS or (
+            self.mxfp4_backend == Mxfp4MoeBackend.AITER_MXFP4_BF16 and is_gfx1250
+        ):
             # TRITON backends free w13/w2_weight_scale after swizzling; the
             # swizzled scales live inside the precision configs instead.
             assert self.w13_precision_config is not None
@@ -810,6 +864,18 @@ class Mxfp4MoEMethod(FusedMoEMethodBase):
             w1_scale = layer.w13_weight_scale
             w2_scale = layer.w2_weight_scale
 
+        if self.mxfp4_backend == Mxfp4MoeBackend.EMULATION:
+            # Canonical ``mxfp4`` checkpoints are weight-only W4A16. The
+            # generic EMULATION config is W4A4, so preserve BF16 activations
+            # while the fallback dequantizes only the weights.
+            return mxfp4_w4a16_moe_quant_config(
+                w1_scale=w1_scale,
+                w2_scale=w2_scale,
+                w1_bias=w1_bias,
+                w2_bias=w2_bias,
+                gemm1_clamp_limit=swiglu_limit,
+            )
+
         return make_mxfp4_moe_quant_config(
             mxfp4_backend=self.mxfp4_backend,
             w1_scale=w1_scale,
@@ -818,16 +884,6 @@ class Mxfp4MoEMethod(FusedMoEMethodBase):
             w2_bias=w2_bias,
             swiglu_limit=swiglu_limit,
             layer=layer,
-        )
-
-    def select_gemm_impl(
-        self,
-        prepare_finalize: mk.FusedMoEPrepareAndFinalize,
-        layer: RoutedExperts,
-    ) -> mk.FusedMoEExpertsModular:
-        raise ValueError(
-            f"{self.__class__.__name__} uses the new modular kernel "
-            "initialization logic. This function should not be called."
         )
 
     def apply(
@@ -873,4 +929,8 @@ class Mxfp4MoEMethod(FusedMoEMethodBase):
             global_num_experts=layer.global_num_experts,
             expert_map=layer.expert_map,
             apply_router_weight_on_input=layer.apply_router_weight_on_input,
+            num_expert_group=layer.num_expert_group,
+            topk_group=layer.topk_group,
+            e_score_correction_bias=layer.e_score_correction_bias,
+            routed_scaling_factor=layer.routed_scaling_factor,
         )
