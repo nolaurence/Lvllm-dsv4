@@ -21,6 +21,7 @@ from vllm.v1.worker.gpu.attn_utils import (
     init_attn_backend,
 )
 from vllm.v1.worker.gpu.block_table import BlockTables
+from vllm.v1.worker.gpu.dp_utils import DPSyncState
 from vllm.v1.worker.gpu.input_batch import InputBatch, InputBuffers
 from vllm.v1.worker.gpu.model_states.interface import ModelState
 from vllm.v1.worker.gpu.sample.gumbel import gumbel_sample
@@ -60,7 +61,7 @@ class BaseSpeculator(ABC):
         temperature: torch.Tensor,
         # [max_num_reqs]
         seeds: torch.Tensor,
-        num_tokens_across_dp: torch.Tensor | None = None,
+        dp_sync: DPSyncState | None = None,
         dummy_run: bool = False,
         skip_attn_for_dummy_run: bool = False,
         mm_inputs: tuple[list[torch.Tensor], torch.Tensor] | None = None,
@@ -91,8 +92,19 @@ class DraftModelSpeculator(BaseSpeculator):
         self.hidden_size = self.draft_model_config.get_hidden_size()
         # Widen for HC-multiplexed residuals (e.g. DeepSeek V4 feeds the MTP
         # draft the target's pre-hc_head (T, hc_mult * hidden_size) residual).
-        # Non-HC models default to hc_mult=1 and are unaffected.
+        # Non-HC models default to hc_mult=1 and are unaffected. GLM-5.3-Flash is an
+        # exception: it carries hc_mult in the config even when hyper-connection
+        # is disabled (mhc=False), so the widened residual only applies when HC
+        # is actually on. Models without an mhc field keep the hc_mult behavior.
         hc_mult = getattr(self.draft_model_config.hf_config, "hc_mult", 1)
+        if getattr(self.draft_model_config.hf_config, "mhc", None) is False:
+            hc_mult = 1
+        # GLM-5.3-Flash MTP drafts from the regular hidden state + token embed
+        # (eh_proj: hidden*2 -> hidden), not the HC-multiplexed pre-hc_head
+        # residual, so never widen for it regardless of mhc. Covers the target
+        # (glm5_next) and MTP draft (glm5_next_mtp) config model_types.
+        if self.draft_model_config.hf_config.model_type.startswith("glm5_next"):
+            hc_mult = 1
         self.hidden_size = self.hidden_size * hc_mult
         self.vocab_size = self.draft_model_config.get_vocab_size()
         self.dtype = vllm_config.model_config.dtype
@@ -238,6 +250,7 @@ class DraftModelSpeculator(BaseSpeculator):
         num_query_per_req: int = 1,
         causal: bool | Mapping[int, bool] = True,
         query_start_loc_np: np.ndarray | None = None,
+        dcp_local_seq_lens: torch.Tensor | None = None,
     ) -> dict[str, Any] | None:
         if query_start_loc_np is not None:
             # Non-uniform query layout (e.g. multi-module MTP's mixed
@@ -282,6 +295,11 @@ class DraftModelSpeculator(BaseSpeculator):
             query_start_loc_cpu=query_start_loc_cpu,
             max_query_len=max_query_len,
             seq_lens=self.input_buffers.seq_lens[:num_reqs_padded],
+            dcp_local_seq_lens=(
+                None
+                if dcp_local_seq_lens is None
+                else dcp_local_seq_lens[:num_reqs_padded]
+            ),
             max_seq_len=self.draft_max_seq_len,
             block_tables=block_tables,
             slot_mappings=slot_mappings,

@@ -4,7 +4,6 @@ from abc import ABC, abstractmethod
 from collections.abc import Sequence
 from typing import NamedTuple
 
-from vllm import envs
 from vllm.logger import init_logger
 from vllm.utils.math_utils import cdiv, round_down
 from vllm.v1.core.block_pool import BlockPool
@@ -45,16 +44,18 @@ def _validate_prefix_cache_retention_interval(
         isinstance(g.kv_cache_spec, (SlidingWindowSpec, MambaSpec))
         for g in kv_cache_config.kv_cache_groups
     ):
+        if retention_interval == 0:
+            return
         raise ValueError(
-            "VLLM_PREFIX_CACHE_RETENTION_INTERVAL is set but this model has "
+            "prefix_cache_retention_interval is set but this model has "
             "no sliding-window or Mamba KV cache group, so retention has no "
-            "effect. Unset it (it only applies to sliding-window and Mamba "
+            "effect. Set it to 0 (it only applies to sliding-window and Mamba "
             "attention)."
         )
 
     if retention_interval < 0 or retention_interval % scheduler_block_size != 0:
         raise ValueError(
-            f"VLLM_PREFIX_CACHE_RETENTION_INTERVAL ({retention_interval}) "
+            f"prefix_cache_retention_interval ({retention_interval}) "
             "must be non-negative and a multiple of scheduler_block_size "
             f"({scheduler_block_size})."
         )
@@ -151,7 +152,7 @@ class KVCacheCoordinator(ABC):
         # A positive retention interval must be a multiple of the base hit granularity
         # (``scheduler_block_size``) to land on real cache-hit boundaries.
         # 0 = keep only the latest replay boundary; None = dense;
-        self.retention_interval = envs.VLLM_PREFIX_CACHE_RETENTION_INTERVAL
+        self.retention_interval = kv_cache_config.prefix_cache_retention_interval
         _validate_prefix_cache_retention_interval(
             self.retention_interval, self.scheduler_block_size, kv_cache_config
         )
@@ -597,8 +598,15 @@ class HybridKVCacheCoordinator(KVCacheCoordinator):
         # can be a multiple of hash_block_size.
         self.hash_block_size = hash_block_size
         self.dcp_world_size = dcp_world_size
+        # Only groups that participate in prefix caching must satisfy the
+        # divisibility constraint; groups that opt out (e.g. GLM-5.3-Flash kpool
+        # tail, block_size=kpool) are scratch buffers and excluded.
         group_block_sizes = [
-            manager.block_size for manager in self.single_type_managers
+            manager.block_size
+            for manager, group in zip(
+                self.single_type_managers, kv_cache_config.kv_cache_groups
+            )
+            if group.kv_cache_spec.participates_in_prefix_caching
         ]
         assert all(
             block_size % hash_block_size == 0 for block_size in group_block_sizes
@@ -618,15 +626,22 @@ class HybridKVCacheCoordinator(KVCacheCoordinator):
                     "full-attention and Mamba groups, got: "
                     f"{type(g.kv_cache_spec).__name__}."
                 )
-        # Fine-grained hash hits require Mamba "align", no context
-        # parallelism, and compatible cache managers in every group.
+        # Fine-grained hash hits require Mamba "align" and compatible cache
+        # managers in every group. TP needs hashing finer than the Mamba block;
+        # DCP accepts equality because it scales the effective full-attention
+        # block instead.
         has_partial_mamba_group = any(
             isinstance(g.kv_cache_spec, MambaSpec)
             and g.kv_cache_spec.mamba_cache_mode == "align"
-            and g.kv_cache_spec.block_size > hash_block_size
+            and (
+                (dcp_world_size == 1 and g.kv_cache_spec.block_size > hash_block_size)
+                or (
+                    dcp_world_size > 1 and g.kv_cache_spec.block_size >= hash_block_size
+                )
+            )
             for g in kv_cache_config.kv_cache_groups
         )
-        self.enable_partial_hash_hits = dcp_world_size == 1 and has_partial_mamba_group
+        self.enable_partial_hash_hits = has_partial_mamba_group
         if self.enable_partial_hash_hits:
             unsupported_partial_hit_managers = {
                 type(manager).__name__
@@ -660,6 +675,13 @@ class HybridKVCacheCoordinator(KVCacheCoordinator):
         """
         self.attention_groups: list[SpecGroup] = []
         for i, g in enumerate(self.kv_cache_config.kv_cache_groups):
+            # Skip groups that opt out of prefix caching (e.g. GLM-5.3-Flash
+            # kpool tail): their blocks are per-request scratch, never
+            # shareable, so they must not participate in hit lookup (their
+            # manager-level hooks already no-op). Their slot in the per-group
+            # hit tuple stays empty.
+            if not g.kv_cache_spec.participates_in_prefix_caching:
+                continue
             manager_cls = self.single_type_managers[i].__class__
             spec = g.kv_cache_spec
             use_eagle = i in self.eagle_group_ids
