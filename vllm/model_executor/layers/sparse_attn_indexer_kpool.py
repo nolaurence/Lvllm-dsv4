@@ -22,7 +22,10 @@ elif current_platform.is_rocm():
 else:
     from vllm.models.glm5next.nvidia.ops import kpool_compress as kpool_ops
 
-from vllm.utils.deep_gemm import has_deep_gemm
+from vllm.utils.deep_gemm import (
+    _use_sm86_reference,
+    is_deep_gemm_supported,
+)
 from vllm.utils.torch_utils import (
     LayerNameType,
     _encode_layer_name,
@@ -33,6 +36,10 @@ from vllm.v1.attention.backends.mla.indexer import (
     DeepseekV32IndexerMetadata,
 )
 from vllm.v1.attention.ops.common import pack_seq_triton, unpack_seq_triton
+from vllm.v1.attention.ops.mqa_logits_triton import (
+    fp8_mqa_logits_triton,
+    fp8_paged_mqa_logits_triton,
+)
 from vllm.v1.worker.workspace import current_workspace_manager
 
 if current_platform.is_cuda_alike():
@@ -433,6 +440,15 @@ def sparse_attn_indexer_kpool(
                 )
 
     topk_indices_buffer[: hidden_states.shape[0]] = -1
+    # DeepGEMM availability is constant per process; check once for both
+    # branches. `VLLM_SM86_DEEPSEEK_V4_REF=1` keeps the PyTorch reference
+    # path as an escape hatch on SM<90.
+    use_deep_gemm = is_deep_gemm_supported()
+    use_triton_logits = not use_deep_gemm and not _use_sm86_reference()
+    if use_triton_logits:
+        assert not use_fp4_cache, (
+            "Triton sparse-MLA fallback does not support FP4 KV cache"
+        )
     if has_prefill:
         prefill_metadata = attn_metadata_narrowed.prefill
         assert prefill_metadata is not None
@@ -535,11 +551,21 @@ def sparse_attn_indexer_kpool(
                     chunk.cu_seqlen_ks,
                     chunk.cu_seqlen_ke,
                 )
-            else:
+            elif use_deep_gemm:
                 from vllm.utils.deep_gemm import fp8_fp4_mqa_logits
 
                 logits = fp8_fp4_mqa_logits(
                     (q_slice_cast, q_scale_slice),
+                    (k_quant_cast, k_scale_cast),
+                    weights[chunk.token_start : chunk.token_end],
+                    chunk.cu_seqlen_ks,
+                    chunk.cu_seqlen_ke,
+                    clean_logits=False,
+                )
+            else:
+                # SM80/SM86 Triton fallback (DeepGEMM unavailable).
+                logits = fp8_mqa_logits_triton(
+                    q_slice_cast,
                     (k_quant_cast, k_scale_cast),
                     weights[chunk.token_start : chunk.token_end],
                     chunk.cu_seqlen_ks,
@@ -798,6 +824,31 @@ def sparse_attn_indexer_kpool(
                 decode_metadata.schedule_metadata,
                 max_model_len=max_model_len,
             )
+        elif use_deep_gemm:
+            from vllm.utils.deep_gemm import fp8_fp4_paged_mqa_logits
+
+            logits = fp8_fp4_paged_mqa_logits(
+                (padded_q_quant_cast, padded_q_scale),
+                kv_cache,
+                padded_weights[:num_padded_tokens],
+                seq_lens,
+                decode_metadata.block_table,
+                decode_metadata.schedule_metadata,
+                max_model_len=max_model_len,
+                clean_logits=False,
+            )
+        elif use_triton_logits:
+            # SM80/SM86 Triton fallback; the paged kernel indexes the KV pool
+            # via the block table the same way DeepGEMM does.
+            logits = fp8_paged_mqa_logits_triton(
+                padded_q_quant_cast,
+                kv_cache,
+                padded_weights[:num_padded_tokens],
+                seq_lens,
+                decode_metadata.block_table,
+                max_model_len=max_model_len,
+                clean_logits=False,
+            )
         else:
             from vllm.utils.deep_gemm import fp8_fp4_paged_mqa_logits
 
@@ -974,9 +1025,15 @@ class SparseAttnIndexerKpool(CustomOp):
         self.topk_indices_buffer = topk_indices_buffer
         self.skip_k_cache_insert = skip_k_cache_insert
         self.use_fp4_cache = use_fp4_cache
-        if current_platform.is_cuda() and not has_deep_gemm():
-            raise RuntimeError(
-                "Sparse Attention Indexer CUDA op requires DeepGEMM to be installed."
+        # On SM80/SM86 (A100, RTX 30x0) DeepGEMM is unavailable — fall back
+        # to the Triton sparse-MLA path (mqa_logits_triton.py); with
+        # VLLM_SM86_DEEPSEEK_V4_REF=1 the PyTorch reference handles it.
+        # Downgrade the hard error to a one-time warning so the indexer
+        # routes through a supported backend.
+        if current_platform.is_cuda() and not is_deep_gemm_supported():
+            logger.warning_once(
+                "DeepGEMM not supported on this platform; "
+                "using Triton fallback for sparse attention indexer."
             )
 
     def forward_native(
