@@ -278,7 +278,11 @@ if TYPE_CHECKING:
     VLLM_KV_EVENTS_USE_INT_BLOCK_HASHES: bool = True
     VLLM_OBJECT_STORAGE_SHM_BUFFER_NAME: str = "VLLM_OBJECT_STORAGE_SHM_BUFFER"
     LVLLM_MOE_NUMA_ENABLED: bool = False
+    LVLLM_GLM5_ATTN_W4A16: bool = False
+    LVLLM_GLM5_SHARED_EXPERT_CPU: bool = False
+    LVLLM_GLM5_DEFERRED_MOE_ALLREDUCE: bool = False
     LVLLM_MOE_PROFILE_MAX_TOKENS: int = 8192
+    LVLLM_KT_FP8_CHUNK_SIZE: int = 128
     VLLM_DEEPEP_BUFFER_SIZE_MB: int = 1024
     VLLM_DEEPEP_HIGH_THROUGHPUT_FORCE_INTRA_NODE: bool = False
     VLLM_DEEPEP_LOW_LATENCY_USE_MNNVL: bool = False
@@ -2005,10 +2009,25 @@ environment_variables: dict[str, Callable[[], Any]] = {
     "LVLLM_MOE_NUMA_ENABLED": lambda: bool(
         int(os.getenv("LVLLM_MOE_NUMA_ENABLED", "0"))
     ),
+    # Fail-closed compatibility flag for the disabled GLM-5 attention W4 path.
+    "LVLLM_GLM5_ATTN_W4A16": lambda: bool(int(os.getenv("LVLLM_GLM5_ATTN_W4A16", "0"))),
+    # Fold GLM-5's shared expert into the LK CPU MoE as one always-on expert.
+    "LVLLM_GLM5_SHARED_EXPERT_CPU": lambda: bool(
+        int(os.getenv("LVLLM_GLM5_SHARED_EXPERT_CPU", "0"))
+    ),
+    # Delay each GLM-5 MoE TP all-reduce to the next mHC layer entrance.
+    "LVLLM_GLM5_DEFERRED_MOE_ALLREDUCE": lambda: bool(
+        int(os.getenv("LVLLM_GLM5_DEFERRED_MOE_ALLREDUCE", "0"))
+    ),
     # Cap the startup profile dummy batch when lk::MOE CPU offload is enabled.
     # Set to 0 to profile with the full scheduler max_num_batched_tokens.
     "LVLLM_MOE_PROFILE_MAX_TOKENS": lambda: int(
         os.getenv("LVLLM_MOE_PROFILE_MAX_TOKENS", "8192")
+    ),
+    # KTransformers FP8 MoE workspace capacity. Larger prefill batches are
+    # evaluated in token chunks of this size.
+    "LVLLM_KT_FP8_CHUNK_SIZE": lambda: int(
+        os.getenv("LVLLM_KT_FP8_CHUNK_SIZE", "128")
     ),
     # Disables parallel execution of shared_experts via separate cuda stream
     "VLLM_DISABLE_SHARED_EXPERTS_STREAM": lambda: bool(

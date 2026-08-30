@@ -1,12 +1,14 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 
+import os
 from collections.abc import Iterable
 from typing import ClassVar, Literal
 
 import torch
 from torch import nn
 
+import vllm.envs as envs
 from vllm.config import ParallelConfig, VllmConfig
 from vllm.distributed import (
     get_ep_group,
@@ -14,6 +16,7 @@ from vllm.distributed import (
     get_tensor_model_parallel_rank,
     get_tensor_model_parallel_world_size,
     tensor_model_parallel_all_gather,
+    tensor_model_parallel_all_reduce,
 )
 from vllm.logger import init_logger
 from vllm.model_executor.layers.activation import SiluAndMul, SiluAndMulWithClamp
@@ -91,8 +94,118 @@ from .multimodal import (
     Glm5NextProcessingInfo,
     Glm5NextVisionTransformer,
 )
+from .quantization import get_glm5_next_attention_quant_config
 
 logger = init_logger(__name__)
+
+
+def _validate_glm5_shared_expert_cpu(
+    config: Glm5NextConfig,
+    parallel_config: ParallelConfig,
+) -> bool:
+    if not envs.LVLLM_GLM5_SHARED_EXPERT_CPU:
+        return False
+    if config.n_shared_experts != 1:
+        raise RuntimeError("GLM shared-expert CPU fusion requires n_shared_experts=1")
+    weight_mode = os.getenv("LVLLM_MOE_USE_WEIGHT", "INT4").upper()
+    if not envs.LVLLM_MOE_NUMA_ENABLED or weight_mode not in {"INT4", "FP8"}:
+        raise RuntimeError(
+            "GLM shared-expert CPU fusion requires LK NUMA mode with "
+            "LVLLM_MOE_USE_WEIGHT=INT4 or FP8"
+        )
+    if not envs.is_lk_moe_numa_enabled():
+        raise RuntimeError(
+            "GLM shared-expert CPU fusion requires the vllm._lk_C extension"
+        )
+    if os.getenv("LVLLM_ENABLE_MOE_LAYERWISE_LOAD") != "1":
+        raise RuntimeError(
+            "GLM shared-expert CPU fusion requires LVLLM_ENABLE_MOE_LAYERWISE_LOAD=1"
+        )
+    if not envs.VLLM_USE_BREAKABLE_CUDAGRAPH:
+        raise RuntimeError(
+            "GLM shared-expert CPU fusion requires VLLM_USE_BREAKABLE_CUDAGRAPH=1"
+        )
+    if os.getenv("LVLLM_GPU_RESIDENT_MOE_LAYERS", ""):
+        raise RuntimeError(
+            "GLM shared-expert CPU fusion does not support resident GPU MoE layers"
+        )
+    if parallel_config.enable_expert_parallel or parallel_config.enable_eplb:
+        raise RuntimeError(
+            "GLM shared-expert CPU fusion currently requires EP1/EPLB off"
+        )
+    if parallel_config.use_sequence_parallel_moe:
+        raise RuntimeError(
+            "GLM shared-expert CPU fusion currently requires sequence-parallel MoE off"
+        )
+    if getattr(parallel_config, "use_ubatching", False):
+        raise RuntimeError(
+            "GLM shared-expert CPU fusion currently requires ubatching/DBO off"
+        )
+    return True
+
+
+def _try_load_glm5_lk_shared_expert(
+    name: str,
+    loaded_weight: torch.Tensor,
+    params_dict: dict[str, nn.Parameter],
+    shared_expert_id: int,
+) -> str | None:
+    if not envs.LVLLM_GLM5_SHARED_EXPERT_CPU or ".mlp.shared_experts." not in name:
+        return None
+    mappings = (
+        ("gate_proj", "w13", "w1"),
+        ("down_proj", "w2", "w2"),
+        ("up_proj", "w13", "w3"),
+    )
+    for checkpoint_name, parameter_name, shard_id in mappings:
+        marker = f".mlp.shared_experts.{checkpoint_name}."
+        if marker not in name:
+            continue
+        mapped_name = name.replace(
+            marker,
+            f".mlp.experts.routed_experts.{parameter_name}_",
+        )
+        param = params_dict[mapped_name]
+        param.weight_loader(
+            param,
+            loaded_weight,
+            mapped_name,
+            expert_id=shared_expert_id,
+            shard_id=shard_id,
+        )
+        return mapped_name
+    raise RuntimeError(f"Unsupported GLM shared-expert checkpoint tensor: {name}")
+
+
+def _validate_glm5_deferred_moe_allreduce(
+    config: Glm5NextConfig,
+    parallel_config: ParallelConfig,
+    tp_size: int,
+) -> bool:
+    if not envs.LVLLM_GLM5_DEFERRED_MOE_ALLREDUCE:
+        return False
+    if tp_size <= 1:
+        return False
+    if not envs.VLLM_USE_BREAKABLE_CUDAGRAPH:
+        raise RuntimeError(
+            "GLM deferred MoE all-reduce requires VLLM_USE_BREAKABLE_CUDAGRAPH=1"
+        )
+    if config.mhc_num_residual_streams <= 1:
+        raise RuntimeError("GLM deferred MoE all-reduce requires mHC layers")
+    if parallel_config.enable_expert_parallel or parallel_config.enable_eplb:
+        raise RuntimeError("GLM deferred MoE all-reduce requires EP1/EPLB off")
+    if parallel_config.use_sequence_parallel_moe:
+        raise RuntimeError(
+            "GLM deferred MoE all-reduce requires sequence-parallel MoE off"
+        )
+    if getattr(parallel_config, "use_ubatching", False):
+        raise RuntimeError("GLM deferred MoE all-reduce requires ubatching/DBO off")
+    logger.info_once(
+        "Enabling experimental GLM deferred MoE all-reduce: each sparse "
+        "layer's TP partial is reduced at the next mHC layer entrance. "
+        "KTransformers main does not enable this path for GLM."
+    )
+    return True
 
 
 class Glm5NextMLP(nn.Module):
@@ -170,6 +283,16 @@ class Glm5NextMoE(nn.Module):
         self.n_shared_experts: int = config.n_shared_experts
 
         self.is_sequence_parallel = parallel_config.use_sequence_parallel_moe
+        self.shared_expert_cpu = _validate_glm5_shared_expert_cpu(
+            config, parallel_config
+        )
+        self.defer_moe_allreduce = _validate_glm5_deferred_moe_allreduce(
+            config, parallel_config, self.tp_size
+        )
+        if self.shared_expert_cpu and apply_routed_scale_to_output:
+            raise RuntimeError(
+                "GLM shared-expert CPU fusion requires routed scaling in the router"
+            )
 
         if config.hidden_act != "silu":
             raise ValueError(
@@ -206,7 +329,7 @@ class Glm5NextMoE(nn.Module):
         )
 
         swiglu_limit = config.swiglu_limit
-        if config.n_shared_experts is None:
+        if config.n_shared_experts is None or self.shared_expert_cpu:
             self.shared_experts = None
         else:
             intermediate_size = config.moe_intermediate_size * config.n_shared_experts
@@ -245,6 +368,7 @@ class Glm5NextMoE(nn.Module):
             n_shared_experts=None,
             router_logits_dtype=self.gate.out_dtype,
             swiglu_limit=swiglu_limit,
+            reduce_results=not self.defer_moe_allreduce,
         )
 
     def forward(
@@ -261,9 +385,11 @@ class Glm5NextMoE(nn.Module):
 
         # The router is always external (self.gate); main's MoERunner expects
         # pre-computed router_logits, so compute them here unconditionally.
-        router_logits, _ = self.gate(hidden_states)
         final_hidden_states = self.experts(
-            hidden_states=hidden_states, router_logits=router_logits
+            hidden_states=hidden_states,
+            # The runner owns the same gate and computes logits inside the opaque
+            # MoE op. Passing the input avoids launching this gate twice.
+            router_logits=hidden_states,
         )
 
         if self.is_sequence_parallel and not already_sequence_parallel:
@@ -290,6 +416,10 @@ class Glm5NextDecoderLayer(nn.Module):
 
         cache_config = vllm_config.cache_config
         quant_config = vllm_config.quant_config
+        attention_quant_config = get_glm5_next_attention_quant_config(
+            quant_config,
+            checkpoint_weights_are_fp8=not config.is_kda_layer(layer_idx),
+        )
         parallel_config = vllm_config.parallel_config
 
         self.hidden_size = config.hidden_size
@@ -307,6 +437,7 @@ class Glm5NextDecoderLayer(nn.Module):
             self.self_attn = Glm5NextLinearAttention(
                 config=config,
                 vllm_config=vllm_config,
+                quant_config=attention_quant_config,
                 prefix=f"{prefix}.self_attn",
             )
         else:
@@ -326,7 +457,7 @@ class Glm5NextDecoderLayer(nn.Module):
                 kv_lora_rank=config.kv_lora_rank,
                 max_position_embeddings=config.max_position_embeddings,
                 cache_config=cache_config,
-                quant_config=None,  # MLA projections are BF16 in checkpoint
+                quant_config=attention_quant_config,
                 prefix=f"{prefix}.self_attn",
                 topk_indices_buffer=topk_indices_buffer,
                 skip_rope=config.mla_nope,
@@ -342,6 +473,14 @@ class Glm5NextDecoderLayer(nn.Module):
             else (mlp_layer_types[-1] if mlp_layer_types else "sparse")
         )
         if self.is_moe and self.num_experts is not None and mlp_type == "sparse":
+            if is_mtp_layer and (
+                envs.LVLLM_GLM5_SHARED_EXPERT_CPU
+                or envs.LVLLM_GLM5_DEFERRED_MOE_ALLREDUCE
+            ):
+                raise RuntimeError(
+                    "GLM shared-expert CPU fusion and deferred MoE all-reduce "
+                    "do not yet support MTP layers"
+                )
             self.mlp = Glm5NextMoE(
                 config=config,
                 parallel_config=parallel_config,
@@ -360,6 +499,14 @@ class Glm5NextDecoderLayer(nn.Module):
         self.input_layernorm = RMSNorm(config.hidden_size, eps=config.rms_norm_eps)
         # Cached for the hot forward path (isinstance per layer per step).
         self._mlp_is_moe = isinstance(self.mlp, Glm5NextMoE)
+        self.defer_moe_allreduce = bool(
+            self._mlp_is_moe and self.mlp.defer_moe_allreduce
+        )
+        self.reduce_previous_moe_output = bool(
+            self.defer_moe_allreduce
+            and layer_idx > 0
+            and config.mlp_layer_types[layer_idx - 1] == "sparse"
+        )
         # In SP, the attention output projection leaves a partial sum; the
         # decoder-layer reduce_scatter after attention completes it (DSv4 pattern).
         # MTP layers use the non-mHC path which has no sp_reduce_scatter, so
@@ -443,6 +590,8 @@ class Glm5NextDecoderLayer(nn.Module):
         # hc_post with this layer's attn hc_pre into one kernel (inter-layer
         # fusion). Layer 0 has no incoming state -> standalone hc_pre.
         x = hidden_states
+        if self.reduce_previous_moe_output:
+            x = tensor_model_parallel_all_reduce(x)
         if post is None:
             if self.layer_idx == 0:
                 x = hc_expand(x, self.n)
@@ -504,6 +653,8 @@ class Glm5NextDecoderLayer(nn.Module):
         # to fuse with) then contracts; every other layer defers its hc_post to
         # the next layer's fused pre, returning the state.
         if self.layer_idx == self.num_hidden_layers - 1:
+            if self.defer_moe_allreduce:
+                x = tensor_model_parallel_all_reduce(x)
             x = self.hc_post(x, residual, post, comb)
             x = hc_contract(x, self.n)
             return x, None, None, None
@@ -767,6 +918,16 @@ class Glm5NextModel(nn.Module):
             if "rotary_emb.cos_cached" in name or "rotary_emb.sin_cached" in name:
                 # Models trained using ColossalAI may include these tensors in
                 # the checkpoint. Skip them.
+                continue
+
+            shared_param_name = _try_load_glm5_lk_shared_expert(
+                name,
+                loaded_weight,
+                params_dict,
+                shared_expert_id=self.config.n_routed_experts,
+            )
+            if shared_param_name is not None:
+                loaded_params.add(shared_param_name)
                 continue
 
             # Handle FP8 indexer WK: dequantize to BF16 for fusion with

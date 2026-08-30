@@ -5,13 +5,18 @@ from __future__ import annotations
 
 import ctypes
 import gc
+import importlib.util
 import os
+import sys
 import time
 from contextlib import suppress
+from pathlib import Path
 from typing import Any, ClassVar
 
 import torch
 
+import vllm.envs as envs
+from vllm.compilation.breakable_cudagraph import eager_break_during_capture
 from vllm.config import get_current_vllm_config
 from vllm.envs import is_lk_moe_numa_enabled
 from vllm.logger import init_logger
@@ -80,8 +85,45 @@ def should_use_lk_moe(layer_name: str) -> bool:
     return True
 
 
+def _weight_mode() -> str:
+    return os.getenv("LVLLM_MOE_USE_WEIGHT", "INT4").upper()
+
+
 def _use_int4_weights() -> bool:
-    return os.getenv("LVLLM_MOE_USE_WEIGHT", "INT4").upper() == "INT4"
+    return _weight_mode() == "INT4"
+
+
+def _load_kt_kernel_ext():
+    module = sys.modules.get("kt_kernel_ext")
+    if module is not None:
+        return module
+
+    override = os.getenv("LVLLM_KT_KERNEL_EXT_PATH")
+    if override:
+        candidates = [Path(override)]
+    else:
+        candidates = sorted(
+            Path(__file__).resolve().parents[3].glob("kt_kernel_ext*.so")
+        )
+    if not candidates or not candidates[0].is_file():
+        raise RuntimeError(
+            "LVLLM_MOE_USE_WEIGHT=FP8 requires a KTransformers main "
+            "kt_kernel_ext build. Set LVLLM_KT_KERNEL_EXT_PATH to its .so file."
+        )
+
+    spec = importlib.util.spec_from_file_location("kt_kernel_ext", candidates[0])
+    if spec is None or spec.loader is None:
+        raise RuntimeError(f"Cannot load kt_kernel_ext from {candidates[0]}")
+    module = importlib.util.module_from_spec(spec)
+    old_dlopen_flags = sys.getdlopenflags()
+    deepbind = getattr(os, "RTLD_DEEPBIND", 0)
+    try:
+        sys.setdlopenflags(os.RTLD_NOW | os.RTLD_LOCAL | deepbind)
+        spec.loader.exec_module(module)
+    finally:
+        sys.setdlopenflags(old_dlopen_flags)
+    sys.modules["kt_kernel_ext"] = module
+    return module
 
 
 def _moe_stride(hidden_size: int, intermediate_size: int) -> int:
@@ -121,20 +163,44 @@ def _group_len(name: str, default: int) -> int:
     return value
 
 
+def _glm5_lk_shared_expert_count() -> int:
+    if not envs.LVLLM_GLM5_SHARED_EXPERT_CPU:
+        return 0
+    hf_config = get_current_vllm_config().model_config.hf_config
+    if getattr(hf_config, "model_type", None) not in {
+        "glm5_next",
+        "glm5_next_text",
+    }:
+        raise RuntimeError(
+            "LVLLM_GLM5_SHARED_EXPERT_CPU is only supported by GLM-5-Next"
+        )
+    count = int(getattr(hf_config, "n_shared_experts", 0) or 0)
+    if count != 1:
+        raise RuntimeError(
+            "GLM shared-expert CPU fusion currently requires n_shared_experts=1, "
+            f"got {count}"
+        )
+    return count
+
+
 class LkRoutedExperts(RoutedExperts):
     """Routed experts backed by LvLLM's NUMA-aware CPU MoE extension."""
 
     _lk_deferred_pending: ClassVar[
         dict[tuple[int, int], tuple[int, int, int, bool, Any, torch.Tensor]]
     ] = {}
+    _kt_fp8_module: ClassVar[Any | None] = None
+    _kt_fp8_cpu_infer: ClassVar[Any | None] = None
 
     def __init__(self, *args, **kwargs):
         # Quant methods inspect this flag while RoutedExperts creates weights.
         self.use_lk_moe = True
+        self.lk_extra_shared_experts = _glm5_lk_shared_expert_count()
         super().__init__(*args, **kwargs)
 
         self.lk_moe = None
         self.lk_moe_config = None
+        self._kt_fp8_enabled = False
         self._lk_cpu_buffers: dict[
             tuple[str, tuple[int, ...], torch.dtype], torch.Tensor
         ] = {}
@@ -153,6 +219,11 @@ class LkRoutedExperts(RoutedExperts):
         except ValueError:
             deferred_experts = 0
         self._lk_max_deferred_experts = max(0, min(deferred_experts, self.top_k))
+        if self.lk_extra_shared_experts and self._lk_max_deferred_experts:
+            raise RuntimeError(
+                "GLM shared-expert CPU fusion is incompatible with "
+                "LVLLM_LK_DEFERRED_EXPERTS"
+            )
         if num_hidden_layers is not None and self.layer_id == num_hidden_layers - 1:
             self._lk_max_deferred_experts = 0
 
@@ -185,8 +256,35 @@ class LkRoutedExperts(RoutedExperts):
             self._maybe_init_lk_moe()
 
     def _maybe_init_lk_moe(self) -> None:
-        if not _use_int4_weights():
+        weight_mode = _weight_mode()
+        if weight_mode not in {"INT4", "FP8"}:
             return
+        from vllm.model_executor.layers.quantization.fp8 import Fp8MoEMethod
+
+        if isinstance(self.quant_method, Fp8MoEMethod):
+            if not self.quant_method.block_quant:
+                raise ValueError(
+                    "LK CPU conversion requires block-scaled FP8 MoE weights; "
+                    "per-tensor FP8 is not supported."
+                )
+            try:
+                if weight_mode == "FP8":
+                    self._process_fp8_block_weights_to_kt_fp8()
+                else:
+                    self._process_fp8_block_weights_to_lk_int4()
+            except Exception as err:
+                self.lk_moe = None
+                self.lk_moe_config = None
+                raise RuntimeError(
+                    f"Failed to initialize {weight_mode} CPU MoE"
+                ) from err
+            return
+
+        if weight_mode == "FP8":
+            raise RuntimeError(
+                "LVLLM_MOE_USE_WEIGHT=FP8 requires a block-FP8 checkpoint"
+            )
+
         try:
             from vllm.model_executor.layers.quantization.mxfp4 import (
                 GptOssMxfp4MoEMethod,
@@ -199,6 +297,117 @@ class LkRoutedExperts(RoutedExperts):
             self.lk_moe = None
             self.lk_moe_config = None
             raise RuntimeError("Failed to initialize MXFP4 lk::MOE") from err
+
+    @classmethod
+    def _get_kt_fp8_runtime(cls):
+        if cls._kt_fp8_module is None:
+            cls._kt_fp8_module = _load_kt_kernel_ext()
+        if cls._kt_fp8_cpu_infer is None:
+            threads = max(1, int(os.getenv("LK_THREADS", "1")))
+            cls._kt_fp8_cpu_infer = cls._kt_fp8_module.CPUInfer(threads)
+        return cls._kt_fp8_module, cls._kt_fp8_cpu_infer
+
+    def _process_fp8_block_weights_to_kt_fp8(self) -> None:
+        if self.quant_method.weight_block_size != [128, 128]:
+            raise ValueError(
+                "KTransformers FP8 CPU MoE requires weight_block_size=[128, 128]"
+            )
+
+        kt_ext, cpu_infer = self._get_kt_fp8_runtime()
+        w13_weight = self.w13_weight
+        w2_weight = self.w2_weight
+        w13_scale = self.w13_weight_scale_inv
+        w2_scale = self.w2_weight_scale_inv
+
+        expert_num, total_intermediate, hidden = w13_weight.shape
+        intermediate = total_intermediate // 2
+        if total_intermediate % 2 or w2_weight.shape != (
+            expert_num,
+            hidden,
+            intermediate,
+        ):
+            raise ValueError(
+                "Unexpected block-FP8 tensors for KTransformers CPU MoE: "
+                f"w13={tuple(w13_weight.shape)}, w2={tuple(w2_weight.shape)}"
+            )
+
+        gate_weights = [w13_weight[i, :intermediate] for i in range(expert_num)]
+        up_weights = [w13_weight[i, intermediate:] for i in range(expert_num)]
+        down_weights = [w2_weight[i] for i in range(expert_num)]
+        gate_scales = [
+            w13_scale[i, : intermediate // 128].float().contiguous()
+            for i in range(expert_num)
+        ]
+        up_scales = [
+            w13_scale[i, intermediate // 128 :].float().contiguous()
+            for i in range(expert_num)
+        ]
+        down_scales = [w2_scale[i].float().contiguous() for i in range(expert_num)]
+        if not all(
+            tensor.is_contiguous()
+            for tensor in (*gate_weights, *up_weights, *down_weights)
+        ):
+            raise ValueError("KTransformers FP8 expert weights must be contiguous")
+
+        self._kt_fp8_gpu_mask = torch.zeros(expert_num, dtype=torch.bool)
+        effective_topk = self.top_k + max(expert_num - self.local_num_experts, 0)
+        config = kt_ext.moe.MOEConfig(
+            expert_num,
+            effective_topk,
+            hidden,
+            intermediate,
+            self._kt_fp8_gpu_mask.data_ptr(),
+        )
+        config.layer_idx = self.layer_id or 0
+        config.pool = cpu_infer.backend_
+        config.max_len = max(4, int(envs.LVLLM_KT_FP8_CHUNK_SIZE))
+        config.swiglu_limit = float(self.swiglu_limit or 0.0)
+        config.quant_config.bits = 8
+        config.quant_config.group_size = 128
+        config.quant_config.zero_point = False
+        config.gate_projs = [[tensor.data_ptr() for tensor in gate_weights]]
+        config.up_projs = [[tensor.data_ptr() for tensor in up_weights]]
+        config.down_projs = [[tensor.data_ptr() for tensor in down_weights]]
+        config.gate_scales = [[tensor.data_ptr() for tensor in gate_scales]]
+        config.up_scales = [[tensor.data_ptr() for tensor in up_scales]]
+        config.down_scales = [[tensor.data_ptr() for tensor in down_scales]]
+
+        self.lk_moe_config = config
+        self._kt_fp8_max_len = config.max_len
+        self.lk_moe = kt_ext.moe.AVX2FP8_MOE(config)
+        cpu_infer.submit(self.lk_moe.load_weights_task())
+        cpu_infer.sync()
+        self._kt_fp8_enabled = True
+
+        empty_weight = torch.empty(0, device="cpu", dtype=torch.uint8)
+        for name in (
+            "w13_weight",
+            "w2_weight",
+            "w13_weight_scale_inv",
+            "w2_weight_scale_inv",
+        ):
+            replace_parameter(self, name, empty_weight)
+        del w13_weight, w2_weight, w13_scale, w2_scale
+        del gate_weights, up_weights, down_weights
+        del gate_scales, up_scales, down_scales
+        gc.collect()
+        _malloc_trim()
+        logger.info(
+            "Initialized native block-FP8 CPU MoE for layer %s: experts=%d topk=%d",
+            self.layer_name,
+            expert_num,
+            effective_topk,
+        )
+
+    @staticmethod
+    def _lk_quant_device() -> torch.device:
+        if os.getenv("LVLLM_MOE_QUANT_ON_GPU", "0") != "1":
+            return torch.device("cpu")
+        if not torch.cuda.is_available():
+            raise RuntimeError(
+                "LVLLM_MOE_QUANT_ON_GPU=1 requires an available CUDA device"
+            )
+        return torch.device("cuda", torch.cuda.current_device())
 
     @staticmethod
     def _ggml_type_from_dtype(dtype: torch.dtype) -> int:
@@ -279,6 +488,163 @@ class LkRoutedExperts(RoutedExperts):
         out_shape = (*weight.shape[:-1], weight.shape[-1] // 32 * 18)
         return block_bytes.reshape(out_shape).contiguous()
 
+    @staticmethod
+    def _dequant_fp8_block_weight(
+        weight: torch.Tensor,
+        scale_inv: torch.Tensor,
+        block_shape: list[int],
+        device: torch.device,
+    ) -> torch.Tensor:
+        if weight.dtype != torch.float8_e4m3fn:
+            raise ValueError(
+                "LK block-FP8 conversion requires float8_e4m3fn weights, "
+                f"got {weight.dtype}"
+            )
+        if len(block_shape) != 2 or any(size <= 0 for size in block_shape):
+            raise ValueError(f"Invalid FP8 block shape: {block_shape}")
+
+        block_n, block_k = block_shape
+        rows, cols = weight.shape
+        expected_scale_shape = (
+            (rows + block_n - 1) // block_n,
+            (cols + block_k - 1) // block_k,
+        )
+        if tuple(scale_inv.shape) != expected_scale_shape:
+            raise ValueError(
+                "Unexpected block-FP8 scale shape: "
+                f"weight={tuple(weight.shape)}, scale={tuple(scale_inv.shape)}, "
+                f"expected={expected_scale_shape}"
+            )
+
+        dequant = weight.to(device, non_blocking=device.type == "cuda").float()
+        scale = scale_inv.to(
+            device=device, dtype=torch.float32, non_blocking=device.type == "cuda"
+        )
+        scale = scale.repeat_interleave(block_n, dim=0).repeat_interleave(
+            block_k, dim=1
+        )
+        return dequant.mul_(scale[:rows, :cols])
+
+    def _process_fp8_block_weights_to_lk_int4(self) -> None:
+        import vllm._lk_C
+
+        block_shape = self.quant_method.weight_block_size
+        if block_shape is None:
+            raise ValueError("Block-scaled FP8 weights require weight_block_size")
+
+        w13_weight = self.w13_weight
+        w2_weight = self.w2_weight
+        w13_scale = self.w13_weight_scale_inv
+        w2_scale = self.w2_weight_scale_inv
+
+        expert_num, total_intermediate, hidden = w13_weight.shape
+        if total_intermediate % 2 != 0:
+            raise ValueError(
+                "FP8 w13 output dimension must contain equal gate/up shards, "
+                f"got {total_intermediate}"
+            )
+        intermediate = total_intermediate // 2
+        if w2_weight.shape != (expert_num, hidden, intermediate):
+            raise ValueError(
+                "Unexpected block-FP8 w2 shape for lk::MOE conversion: "
+                f"{tuple(w2_weight.shape)}"
+            )
+
+        if hidden % 32 != 0 or intermediate % 32 != 0:
+            raise ValueError(
+                "LK Q4_0 conversion requires hidden and intermediate dimensions "
+                f"divisible by 32, got hidden={hidden}, intermediate={intermediate}"
+            )
+        convert_device = self._lk_quant_device()
+        q4_row_bytes_hidden = hidden // 32 * 18
+        q4_row_bytes_intermediate = intermediate // 32 * 18
+
+        gate_q4 = torch.empty(
+            (expert_num, intermediate, q4_row_bytes_hidden),
+            dtype=torch.uint8,
+            device="cpu",
+        )
+        up_q4 = torch.empty_like(gate_q4)
+        down_q4 = torch.empty(
+            (expert_num, hidden, q4_row_bytes_intermediate),
+            dtype=torch.uint8,
+            device="cpu",
+        )
+
+        for expert_idx in range(expert_num):
+            w13_dequant = self._dequant_fp8_block_weight(
+                w13_weight[expert_idx],
+                w13_scale[expert_idx],
+                block_shape,
+                convert_device,
+            )
+            gate_q4[expert_idx].copy_(
+                self._quantize_rows_q4_0(w13_dequant[:intermediate]),
+                non_blocking=False,
+            )
+            up_q4[expert_idx].copy_(
+                self._quantize_rows_q4_0(w13_dequant[intermediate:]),
+                non_blocking=False,
+            )
+            del w13_dequant
+
+            w2_dequant = self._dequant_fp8_block_weight(
+                w2_weight[expert_idx],
+                w2_scale[expert_idx],
+                block_shape,
+                convert_device,
+            )
+            down_q4[expert_idx].copy_(
+                self._quantize_rows_q4_0(w2_dequant), non_blocking=False
+            )
+            del w2_dequant
+
+        hidden_ggml_type = self._ggml_type_from_dtype(self.moe_config.in_dtype)
+        q4_0_type = 2
+        group_min_len = _group_len("LVLLM_MOE_GROUP_MIN_LEN", 2)
+        group_max_len = _group_len("LVLLM_MOE_GROUP_MAX_LEN", 1024)
+        self.lk_moe_config = vllm._lk_C.MOEConfig(
+            expert_num,
+            self.top_k + max(expert_num - self.local_num_experts, 0),
+            self.hidden_size,
+            self.intermediate_size_per_partition,
+            _moe_stride(self.hidden_size, self.intermediate_size_per_partition),
+            group_min_len,
+            group_max_len,
+            gate_q4.data_ptr(),
+            up_q4.data_ptr(),
+            down_q4.data_ptr(),
+            q4_0_type,
+            q4_0_type,
+            q4_0_type,
+            hidden_ggml_type,
+            float(self.swiglu_limit or 0.0),
+        )
+        self.lk_moe = vllm._lk_C.MOE(self.lk_moe_config)
+        del gate_q4, up_q4, down_q4
+
+        empty_weight = torch.empty(0, device="cpu", dtype=torch.uint8)
+        for name in (
+            "w13_weight",
+            "w2_weight",
+            "w13_weight_scale_inv",
+            "w2_weight_scale_inv",
+        ):
+            replace_parameter(self, name, empty_weight)
+        del w13_weight, w2_weight, w13_scale, w2_scale
+        gc.collect()
+        _malloc_trim()
+        if convert_device.type == "cuda":
+            torch.cuda.empty_cache()
+        logger.debug(
+            "Initialized block-FP8 lk::MOE Q4_0 weights for layer %s on %s "
+            "(group_min_len=%d, group_max_len=%d)",
+            self.layer_name,
+            convert_device,
+            group_min_len,
+            group_max_len,
+        )
+
     def _process_mxfp4_weights_to_lk_int4(self) -> None:
         import vllm._lk_C
 
@@ -339,8 +705,8 @@ class LkRoutedExperts(RoutedExperts):
         group_min_len = _group_len("LVLLM_MOE_GROUP_MIN_LEN", 2)
         group_max_len = _group_len("LVLLM_MOE_GROUP_MAX_LEN", 1024)
         self.lk_moe_config = vllm._lk_C.MOEConfig(
-            self.local_num_experts,
-            self.top_k,
+            expert_num,
+            self.top_k + max(expert_num - self.local_num_experts, 0),
             self.hidden_size,
             self.intermediate_size_per_partition,
             _moe_stride(self.hidden_size, self.intermediate_size_per_partition),
@@ -353,6 +719,7 @@ class LkRoutedExperts(RoutedExperts):
             q4_0_type,
             q4_0_type,
             hidden_ggml_type,
+            float(self.swiglu_limit or 0.0),
         )
         self.lk_moe = vllm._lk_C.MOE(self.lk_moe_config)
         del gate_q4, up_q4, down_q4
@@ -424,6 +791,7 @@ class LkRoutedExperts(RoutedExperts):
         hidden_states: torch.Tensor,
         topk_weights: torch.Tensor,
         mapped_topk_ids: torch.Tensor,
+        output: torch.Tensor | None = None,
     ) -> torch.Tensor:
         qlen = hidden_states.shape[0]
         k = mapped_topk_ids.shape[1]
@@ -490,12 +858,13 @@ class LkRoutedExperts(RoutedExperts):
             )
 
         stream_ptr = torch.cuda.current_stream(hidden_states.device).cuda_stream
-        output = self._get_lk_gpu_buffer(
-            "output",
-            tuple(hidden_states.shape),
-            hidden_states.dtype,
-            hidden_states.device,
-        )
+        if output is None:
+            output = self._get_lk_gpu_buffer(
+                "output",
+                tuple(hidden_states.shape),
+                hidden_states.dtype,
+                hidden_states.device,
+            )
         sync_decode_env = os.getenv("LVLLM_LK_CPU_DECODE_SYNC")
         sync_method = "cpu_decode_sync_i32" if use_i32_ids else "cpu_decode_sync"
         use_sync_decode = (
@@ -660,6 +1029,124 @@ class LkRoutedExperts(RoutedExperts):
                 )
         return output
 
+    @eager_break_during_capture
+    def _forward_lk_cuda_decode_into(
+        self,
+        hidden_states: torch.Tensor,
+        topk_weights: torch.Tensor,
+        mapped_topk_ids: torch.Tensor,
+        output: torch.Tensor,
+    ) -> torch.Tensor:
+        effective_num_experts = self.local_num_experts + self.lk_extra_shared_experts
+        invalid_mask = (mapped_topk_ids < 0) | (
+            mapped_topk_ids >= effective_num_experts
+        )
+        if torch.any(invalid_mask):
+            invalid = mapped_topk_ids[invalid_mask][:16].detach().cpu().tolist()
+            raise RuntimeError(
+                f"lk::MOE got out-of-range expert ids for layer "
+                f"{self.layer_name}: {invalid}; effective_num_experts="
+                f"{effective_num_experts}"
+            )
+        result = self._forward_lk_cuda_decode(
+            hidden_states,
+            topk_weights,
+            mapped_topk_ids,
+            output=output,
+        )
+        if result.data_ptr() != output.data_ptr():
+            output.copy_(result)
+        return output
+
+    def _append_lk_shared_expert(
+        self,
+        mapped_topk_ids: torch.Tensor,
+        topk_weights: torch.Tensor,
+    ) -> tuple[torch.Tensor, torch.Tensor]:
+        if not self.lk_extra_shared_experts:
+            return mapped_topk_ids, topk_weights
+        if self.lk_extra_shared_experts != 1:
+            raise RuntimeError("Only one GLM shared expert is currently supported")
+        shared_ids = torch.full(
+            (mapped_topk_ids.shape[0], 1),
+            self.local_num_experts,
+            dtype=mapped_topk_ids.dtype,
+            device=mapped_topk_ids.device,
+        )
+        shared_weights = torch.ones(
+            (topk_weights.shape[0], 1),
+            dtype=topk_weights.dtype,
+            device=topk_weights.device,
+        )
+        return (
+            torch.cat((mapped_topk_ids, shared_ids), dim=1),
+            torch.cat((topk_weights, shared_weights), dim=1),
+        )
+
+    @eager_break_during_capture
+    def _forward_kt_fp8_into(
+        self,
+        hidden_states: torch.Tensor,
+        topk_weights: torch.Tensor,
+        mapped_topk_ids: torch.Tensor,
+        output: torch.Tensor,
+    ) -> torch.Tensor:
+        qlen = hidden_states.shape[0]
+        k = mapped_topk_ids.shape[1]
+        max_len = self._kt_fp8_max_len
+        if max_len <= 0:
+            raise RuntimeError("KTransformers FP8 MoE chunk size must be positive")
+        effective_num_experts = self.local_num_experts + self.lk_extra_shared_experts
+        invalid_mask = (mapped_topk_ids < 0) | (
+            mapped_topk_ids >= effective_num_experts
+        )
+        if torch.any(invalid_mask):
+            invalid = mapped_topk_ids[invalid_mask][:16].detach().cpu().tolist()
+            raise RuntimeError(
+                f"KTransformers FP8 MoE got out-of-range expert ids for layer "
+                f"{self.layer_name}: {invalid}; effective_num_experts="
+                f"{effective_num_experts}"
+            )
+        input_cpu = self._get_lk_cpu_buffer(
+            "kt_fp8_input", tuple(hidden_states.shape), hidden_states.dtype
+        )
+        expert_ids_cpu = self._get_lk_cpu_buffer(
+            "kt_fp8_expert_ids", tuple(mapped_topk_ids.shape), torch.int64
+        )
+        weights_cpu = self._get_lk_cpu_buffer(
+            "kt_fp8_weights", tuple(topk_weights.shape), torch.float32
+        )
+        output_cpu = self._get_lk_cpu_buffer(
+            "kt_fp8_output", tuple(hidden_states.shape), hidden_states.dtype
+        )
+        bsz_cpu = self._get_lk_cpu_buffer("kt_fp8_bsz", (1,), torch.int32)
+        input_cpu.copy_(hidden_states.detach(), non_blocking=True)
+        expert_ids_cpu.copy_(
+            mapped_topk_ids.detach().to(torch.int64), non_blocking=True
+        )
+        weights_cpu.copy_(topk_weights.detach().to(torch.float32), non_blocking=True)
+        if hidden_states.is_cuda:
+            torch.cuda.current_stream(hidden_states.device).synchronize()
+
+        _, cpu_infer = self._get_kt_fp8_runtime()
+        for start in range(0, qlen, max_len):
+            end = min(start + max_len, qlen)
+            bsz_cpu[0] = end - start
+            cpu_infer.submit(
+                self.lk_moe.forward_task(
+                    bsz_cpu.data_ptr(),
+                    k,
+                    expert_ids_cpu[start:end].data_ptr(),
+                    weights_cpu[start:end].data_ptr(),
+                    input_cpu[start:end].data_ptr(),
+                    output_cpu[start:end].data_ptr(),
+                    False,
+                )
+            )
+            cpu_infer.sync()
+        output.copy_(output_cpu, non_blocking=output.is_cuda)
+        return output
+
     def forward_lk(
         self,
         hidden_states: torch.Tensor,
@@ -669,7 +1156,6 @@ class LkRoutedExperts(RoutedExperts):
         if self.lk_moe is None:
             raise RuntimeError("lk::MOE is not initialized")
         qlen = hidden_states.shape[0]
-        k = topk_ids.shape[1]
 
         if self._expert_map is not None:
             topk_ids_i64 = topk_ids.to(torch.int64)
@@ -689,24 +1175,51 @@ class LkRoutedExperts(RoutedExperts):
         else:
             mapped_topk_ids = topk_ids
 
+        mapped_topk_ids, topk_weights = self._append_lk_shared_expert(
+            mapped_topk_ids, topk_weights
+        )
+
+        if getattr(self, "_kt_fp8_enabled", False):
+            output = (
+                self._get_lk_gpu_buffer(
+                    "kt_fp8_output",
+                    tuple(hidden_states.shape),
+                    hidden_states.dtype,
+                    hidden_states.device,
+                )
+                if hidden_states.is_cuda
+                else torch.empty_like(hidden_states)
+            )
+            return self._forward_kt_fp8_into(
+                hidden_states, topk_weights, mapped_topk_ids, output
+            )
+
         if (
             hidden_states.is_cuda
             and os.getenv("LVLLM_DISABLE_LK_CPU_DECODE_BRIDGE", "0") != "1"
             and hasattr(self.lk_moe, "cpu_decode")
         ):
-            return self._forward_lk_cuda_decode(
-                hidden_states, topk_weights, mapped_topk_ids
+            output = self._get_lk_gpu_buffer(
+                "output",
+                tuple(hidden_states.shape),
+                hidden_states.dtype,
+                hidden_states.device,
+            )
+            return self._forward_lk_cuda_decode_into(
+                hidden_states, topk_weights, mapped_topk_ids, output
             )
 
+        k = mapped_topk_ids.shape[1]
+        effective_num_experts = self.local_num_experts + self.lk_extra_shared_experts
         invalid_mask = (mapped_topk_ids < 0) | (
-            mapped_topk_ids >= self.local_num_experts
+            mapped_topk_ids >= effective_num_experts
         )
         if torch.any(invalid_mask):
             invalid = mapped_topk_ids[invalid_mask][:16].detach().cpu().tolist()
             raise RuntimeError(
                 f"lk::MOE got out-of-range expert ids for layer "
-                f"{self.layer_name}: {invalid}; local_num_experts="
-                f"{self.local_num_experts}"
+                f"{self.layer_name}: {invalid}; effective_num_experts="
+                f"{effective_num_experts}"
             )
 
         input_cpu = self._get_lk_cpu_buffer(

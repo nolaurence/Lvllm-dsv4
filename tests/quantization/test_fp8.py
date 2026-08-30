@@ -5,12 +5,16 @@
 Run `pytest tests/quantization/test_fp8.py --forked`.
 """
 
+import ctypes
 import logging
+import math
+from types import SimpleNamespace
 
 import pytest
 import regex as re
 import torch
 
+import vllm.model_executor.layers.quantization.fp8 as fp8_module
 from tests.quantization.utils import is_quant_method_supported
 from vllm import _custom_ops as ops
 from vllm.config.model import ModelConfig
@@ -21,6 +25,7 @@ from vllm.model_executor.layers.attention.attention import (
     set_default_quant_scales,
 )
 from vllm.model_executor.layers.fused_moe import FusedMoEFactory
+from vllm.model_executor.layers.fused_moe.lk_routed_experts import LkRoutedExperts
 from vllm.model_executor.layers.quantization.fp8 import (
     Fp8Config,
     Fp8KVCacheMethod,
@@ -48,6 +53,317 @@ MODELS = [
         marks=pytest.mark.skip(reason="Checkpoint removed from HF."),
     ),
 ]
+
+
+@pytest.mark.parametrize("weight_mode", ["INT4", "FP8"])
+def test_fp8_lk_moe_weights_use_meta_layerwise_loading(
+    monkeypatch, weight_mode
+) -> None:
+    monkeypatch.setenv("LVLLM_MOE_USE_WEIGHT", weight_mode)
+    layer = torch.nn.Module()
+    layer.use_lk_moe = True
+    method = object.__new__(Fp8MoEMethod)
+    method.quant_config = SimpleNamespace(
+        is_checkpoint_fp8_serialized=True,
+        activation_scheme="dynamic",
+    )
+    method.weight_block_size = [16, 16]
+    method.block_quant = True
+    method.weight_scale_name = "weight_scale_inv"
+    method.moe = SimpleNamespace(w13_num_shards=2, has_bias=False)
+    initialized_layers = []
+
+    monkeypatch.setattr(
+        fp8_module, "initialize_online_processing", initialized_layers.append
+    )
+    monkeypatch.setattr(fp8_module, "get_tensor_model_parallel_world_size", lambda: 1)
+
+    method.create_weights(
+        layer=layer,
+        num_experts=2,
+        hidden_size=32,
+        intermediate_size_per_partition=32,
+        params_dtype=torch.bfloat16,
+    )
+
+    assert method.uses_meta_device
+    assert layer._vllm_layerwise_restore_device == torch.device("cpu")
+    assert initialized_layers == [layer]
+    for name in (
+        "w13_weight",
+        "w2_weight",
+        "w13_weight_scale_inv",
+        "w2_weight_scale_inv",
+    ):
+        assert getattr(layer, name).device.type == "meta"
+
+
+def test_lk_fp8_block_dequant_matches_reference() -> None:
+    weight = torch.tensor(
+        [
+            [1.0, -2.0, 3.0, -4.0, 5.0, -6.0, 7.0, -8.0],
+            [0.5, -1.5, 2.5, -3.5, 4.5, -5.5, 6.5, -7.5],
+            [2.0, 1.0, -1.0, -2.0, 4.0, 3.0, -3.0, -4.0],
+        ],
+        dtype=torch.float8_e4m3fn,
+    )
+    scale = torch.tensor([[0.25, 0.5], [1.5, 2.0]], dtype=torch.float32)
+    expected_scale = scale.repeat_interleave(2, dim=0).repeat_interleave(4, dim=1)
+    expected = weight.float() * expected_scale[: weight.shape[0], : weight.shape[1]]
+
+    actual = LkRoutedExperts._dequant_fp8_block_weight(
+        weight, scale, [2, 4], torch.device("cpu")
+    )
+
+    torch.testing.assert_close(actual, expected, rtol=0, atol=0)
+
+
+def _clone_uint8_from_ptr(ptr: int, shape: tuple[int, ...]) -> torch.Tensor:
+    numel = math.prod(shape)
+    buffer = (ctypes.c_uint8 * numel).from_address(ptr)
+    return torch.frombuffer(buffer, dtype=torch.uint8).clone().view(shape)
+
+
+@pytest.mark.parametrize("quant_on_gpu", [False, True])
+def test_lk_fp8_block_conversion_packs_q4_and_cleans_source(
+    monkeypatch, quant_on_gpu
+) -> None:
+    if quant_on_gpu and not torch.cuda.is_available():
+        pytest.skip("GPU conversion requires CUDA")
+
+    import vllm._lk_C as lk_C
+
+    torch.manual_seed(2)
+    num_experts, hidden_size, intermediate_size = 2, 128, 128
+    block_shape = [128, 128]
+    w13 = torch.randn(
+        num_experts, 2 * intermediate_size, hidden_size, dtype=torch.float32
+    ).to(torch.float8_e4m3fn)
+    w2 = torch.randn(
+        num_experts, hidden_size, intermediate_size, dtype=torch.float32
+    ).to(torch.float8_e4m3fn)
+    w13_scale = torch.rand(num_experts, 2, 1, dtype=torch.float32) + 0.25
+    w2_scale = torch.rand(num_experts, 1, 1, dtype=torch.float32) + 0.25
+
+    def dequant_reference(weight, scale):
+        expanded = scale.repeat_interleave(128, dim=0).repeat_interleave(128, dim=1)
+        return weight.float() * expanded
+
+    expected_gate = []
+    expected_up = []
+    expected_down = []
+    for expert_idx in range(num_experts):
+        w13_dequant = dequant_reference(w13[expert_idx], w13_scale[expert_idx])
+        expected_gate.append(
+            LkRoutedExperts._quantize_rows_q4_0(w13_dequant[:intermediate_size])
+        )
+        expected_up.append(
+            LkRoutedExperts._quantize_rows_q4_0(w13_dequant[intermediate_size:])
+        )
+        w2_dequant = dequant_reference(w2[expert_idx], w2_scale[expert_idx])
+        expected_down.append(LkRoutedExperts._quantize_rows_q4_0(w2_dequant))
+
+    captured = {}
+
+    def fake_moe_config(*args):
+        gate_shape = (num_experts, intermediate_size, hidden_size // 32 * 18)
+        down_shape = (num_experts, hidden_size, intermediate_size // 32 * 18)
+        captured["gate"] = _clone_uint8_from_ptr(args[7], gate_shape)
+        captured["up"] = _clone_uint8_from_ptr(args[8], gate_shape)
+        captured["down"] = _clone_uint8_from_ptr(args[9], down_shape)
+        captured["types"] = args[10:13]
+        captured["swiglu_limit"] = args[14]
+        return SimpleNamespace(args=args)
+
+    class FakeMOE:
+        def __init__(self, config):
+            self.config = config
+
+    monkeypatch.setattr(lk_C, "MOEConfig", fake_moe_config)
+    monkeypatch.setattr(lk_C, "MOE", FakeMOE)
+    monkeypatch.setenv("LVLLM_MOE_USE_WEIGHT", "INT4")
+    monkeypatch.setenv("LVLLM_MOE_QUANT_ON_GPU", "1" if quant_on_gpu else "0")
+
+    layer = object.__new__(LkRoutedExperts)
+    torch.nn.Module.__init__(layer)
+    method = object.__new__(Fp8MoEMethod)
+    method.block_quant = True
+    method.weight_block_size = block_shape
+    layer.quant_method = method
+    layer.lk_moe = None
+    layer.lk_moe_config = None
+    layer.local_num_experts = num_experts
+    layer.top_k = 2
+    layer.hidden_size = hidden_size
+    layer.intermediate_size_per_partition = intermediate_size
+    layer.layer_name = "model.layers.3.mlp.experts"
+    layer.swiglu_limit = 10.0
+    layer.lk_extra_shared_experts = 0
+    layer.moe_config = SimpleNamespace(in_dtype=torch.bfloat16)
+    layer.register_parameter("w13_weight", torch.nn.Parameter(w13))
+    layer.register_parameter("w2_weight", torch.nn.Parameter(w2))
+    layer.register_parameter("w13_weight_scale_inv", torch.nn.Parameter(w13_scale))
+    layer.register_parameter("w2_weight_scale_inv", torch.nn.Parameter(w2_scale))
+
+    layer._maybe_init_lk_moe()
+
+    assert isinstance(layer.lk_moe, FakeMOE)
+    assert captured["types"] == (2, 2, 2)
+    assert captured["swiglu_limit"] == 10.0
+    assert torch.equal(captured["gate"], torch.stack(expected_gate))
+    assert torch.equal(captured["up"], torch.stack(expected_up))
+    assert torch.equal(captured["down"], torch.stack(expected_down))
+    for name in (
+        "w13_weight",
+        "w2_weight",
+        "w13_weight_scale_inv",
+        "w2_weight_scale_inv",
+    ):
+        param = getattr(layer, name)
+        assert param.numel() == 0
+        assert param.device.type == "cpu"
+        assert param.dtype == torch.uint8
+
+
+@pytest.mark.parametrize("weight_mode", ["INT4", "FP8"])
+def test_fp8_lk_glm_shared_expert_allocates_extra_slot(
+    monkeypatch, weight_mode
+) -> None:
+    monkeypatch.setenv("LVLLM_MOE_USE_WEIGHT", weight_mode)
+    layer = torch.nn.Module()
+    layer.use_lk_moe = True
+    layer.lk_extra_shared_experts = 1
+    method = object.__new__(Fp8MoEMethod)
+    method.quant_config = SimpleNamespace(
+        is_checkpoint_fp8_serialized=True,
+        activation_scheme="dynamic",
+    )
+    method.weight_block_size = [16, 16]
+    method.block_quant = True
+    method.weight_scale_name = "weight_scale_inv"
+    method.moe = SimpleNamespace(w13_num_shards=2, has_bias=False)
+
+    monkeypatch.setattr(fp8_module, "initialize_online_processing", lambda _: None)
+    monkeypatch.setattr(fp8_module, "get_tensor_model_parallel_world_size", lambda: 1)
+
+    method.create_weights(
+        layer=layer,
+        num_experts=2,
+        hidden_size=32,
+        intermediate_size_per_partition=32,
+        params_dtype=torch.bfloat16,
+    )
+
+    assert layer.num_experts == 2
+    assert layer.lk_effective_num_experts == 3
+    assert layer.w13_weight.shape == (3, 64, 32)
+    assert layer.w2_weight.shape == (3, 32, 32)
+    assert layer.w13_weight_scale_inv.shape == (3, 4, 2)
+    assert layer.w2_weight_scale_inv.shape == (3, 2, 2)
+
+
+def test_lk_glm_shared_route_is_appended_after_routed_topk() -> None:
+    layer = object.__new__(LkRoutedExperts)
+    torch.nn.Module.__init__(layer)
+    layer.lk_extra_shared_experts = 1
+    layer.local_num_experts = 288
+    routed_ids = torch.tensor([[7, 11], [13, 17]], dtype=torch.int32)
+    routed_weights = torch.tensor([[0.6, 0.4], [0.75, 0.25]])
+
+    ids, weights = layer._append_lk_shared_expert(routed_ids, routed_weights)
+
+    torch.testing.assert_close(ids[:, :-1], routed_ids)
+    torch.testing.assert_close(weights[:, :-1], routed_weights)
+    assert torch.equal(ids[:, -1], torch.full((2,), 288, dtype=torch.int32))
+    assert torch.equal(weights[:, -1], torch.ones(2))
+
+
+def test_lk_per_tensor_fp8_fails_closed(monkeypatch) -> None:
+    monkeypatch.setenv("LVLLM_MOE_USE_WEIGHT", "INT4")
+    layer = object.__new__(LkRoutedExperts)
+    torch.nn.Module.__init__(layer)
+    method = object.__new__(Fp8MoEMethod)
+    method.block_quant = False
+    layer.quant_method = method
+    layer.lk_moe = None
+    layer.lk_moe_config = None
+
+    with pytest.raises(ValueError, match="per-tensor FP8 is not supported"):
+        layer._maybe_init_lk_moe()
+
+
+def test_lk_per_tensor_fp8_fails_during_method_init(monkeypatch) -> None:
+    monkeypatch.setenv("LVLLM_MOE_USE_WEIGHT", "INT4")
+    config = SimpleNamespace(weight_block_size=None)
+    layer = SimpleNamespace(use_lk_moe=True, moe_config=SimpleNamespace())
+
+    with pytest.raises(ValueError, match="per-tensor FP8 is not supported"):
+        Fp8MoEMethod(config, layer)
+
+
+def test_fp8_lk_keep_mode_preserves_regular_loading(monkeypatch) -> None:
+    monkeypatch.setenv("LVLLM_MOE_USE_WEIGHT", "KEEP")
+    initialized_layers = []
+    selected_backend = object()
+    experts_cls = object()
+    monkeypatch.setattr(
+        fp8_module, "initialize_online_processing", initialized_layers.append
+    )
+    monkeypatch.setattr(
+        fp8_module,
+        "select_fp8_moe_backend",
+        lambda **_: (selected_backend, experts_cls),
+    )
+    monkeypatch.setattr(
+        fp8_module,
+        "process_fp8_weight_tensor_strategy_moe",
+        lambda weight, scale, *_args, **_kwargs: (weight, scale),
+    )
+    monkeypatch.setattr(fp8_module.current_platform, "is_fp8_fnuz", lambda: False)
+
+    layer = torch.nn.Module()
+    layer.use_lk_moe = True
+    layer.moe_config = SimpleNamespace(
+        w13_num_shards=2,
+        has_bias=False,
+        is_act_and_mul=True,
+    )
+    layer.local_num_experts = 2
+    layer.intermediate_size_per_partition = 32
+    config = SimpleNamespace(
+        weight_block_size=None,
+        activation_scheme="dynamic",
+        is_checkpoint_fp8_serialized=True,
+    )
+    method = Fp8MoEMethod(config, layer)
+    setup_calls = []
+    method._setup_kernel = lambda *args: setup_calls.append(args)
+
+    method.create_weights(
+        layer=layer,
+        num_experts=2,
+        hidden_size=32,
+        intermediate_size_per_partition=32,
+        params_dtype=torch.bfloat16,
+    )
+    method.process_weights_after_loading(layer)
+
+    assert method.fp8_backend is selected_backend
+    assert method.experts_cls is experts_cls
+    assert not getattr(method, "uses_meta_device", False)
+    assert not hasattr(layer, "_vllm_layerwise_restore_device")
+    assert initialized_layers == []
+    assert layer.w13_weight.device.type != "meta"
+    assert layer.w2_weight.device.type != "meta"
+    assert len(setup_calls) == 1
+
+
+def test_lk_gpu_quant_requires_cuda(monkeypatch) -> None:
+    monkeypatch.setenv("LVLLM_MOE_QUANT_ON_GPU", "1")
+    monkeypatch.setattr(torch.cuda, "is_available", lambda: False)
+
+    with pytest.raises(RuntimeError, match="requires an available CUDA device"):
+        LkRoutedExperts._lk_quant_device()
 
 
 def test_static_fp8_moe_input_scales_remain_scalar() -> None:

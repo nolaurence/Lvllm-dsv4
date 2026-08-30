@@ -25,7 +25,7 @@ from vllm.v1.attention.ops.mqa_logits_triton import (
     warmup_fp8_paged_mqa_logits_triton,
 )
 from vllm.v1.attention.ops.triton_mla_sparse_kernel import (
-    _DIM_QK,
+    _SUPPORTED_DIM_QK,
     KV_SPLITS_CANDIDATES,
     triton_mla_sparse_attention,
 )
@@ -61,8 +61,12 @@ class TritonMLASparseImpl(XPUMLASparseImpl):
             return
         device = self.topk_indices_buffer.device
         topk = self.topk_indices_buffer.shape[-1]
-        q = torch.empty(1, self.num_heads, _DIM_QK, dtype=torch.bfloat16, device=device)
-        kv = torch.empty(64, 1, _DIM_QK, dtype=torch.bfloat16, device=device)
+        q = torch.empty(
+            1, self.num_heads, self.head_size, dtype=torch.bfloat16, device=device
+        )
+        kv = torch.empty(
+            64, 1, self.head_size, dtype=torch.bfloat16, device=device
+        )
         indices = torch.zeros(1, 1, topk, dtype=torch.int32, device=device)
         for splits in KV_SPLITS_CANDIDATES:
             triton_mla_sparse_attention(
@@ -167,7 +171,7 @@ class TritonMLASparseBackend(AttentionBackend):
 
     @classmethod
     def get_supported_head_sizes(cls) -> list[int]:
-        return [_DIM_QK]
+        return list(_SUPPORTED_DIM_QK)
 
     @classmethod
     def supports_compute_capability(cls, capability: DeviceCapability) -> bool:

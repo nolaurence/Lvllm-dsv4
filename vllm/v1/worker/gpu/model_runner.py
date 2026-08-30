@@ -852,8 +852,22 @@ class GPUModelRunner(LoRAModelRunnerMixin):
                     dummy_mm_inputs, mm_budget
                 )
 
+        profile_num_tokens = self.max_num_tokens
+        if envs.LVLLM_MOE_NUMA_ENABLED and envs.LVLLM_MOE_PROFILE_MAX_TOKENS > 0:
+            profile_num_tokens = min(
+                profile_num_tokens, envs.LVLLM_MOE_PROFILE_MAX_TOKENS
+            )
+            if profile_num_tokens < self.max_num_tokens:
+                logger.info(
+                    "Capping lk::MOE CPU-offload profile run from %d to %d "
+                    "tokens. Set LVLLM_MOE_PROFILE_MAX_TOKENS=0 to restore "
+                    "full profiling.",
+                    self.max_num_tokens,
+                    profile_num_tokens,
+                )
+
         hidden_states, sample_hidden_states = self._dummy_run(
-            self.max_num_tokens, skip_attn=True, is_profile=True
+            profile_num_tokens, skip_attn=True, is_profile=True
         )
 
         # Only run sampler/pooler on last PP rank (non-last ranks return None).

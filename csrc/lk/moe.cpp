@@ -8,6 +8,7 @@
  * @Copyright (c) 2024 by KVCache.AI, All Rights Reserved.
  **/
 #include "moe.h"
+#include <algorithm>
 #include <cstring>
 #include <cstdint>
 #include <cstdlib>
@@ -464,7 +465,7 @@ void MOE::warm_up() {
 
 
 
-static void act_fn(float* up, float* gate, int n) {
+static void act_fn(float* up, float* gate, int n, float swiglu_limit) {
 
 #if defined(__AVX2__)
     constexpr int VEC_SIZE = 8;
@@ -476,6 +477,13 @@ static void act_fn(float* up, float* gate, int n) {
     for (int i = 0; i < n; i += VEC_SIZE) {
         __m256 v_gate = _mm256_load_ps(gate + i);
         __m256 v_up = _mm256_load_ps(up + i);
+
+        if (swiglu_limit > 0.0f) {
+            const __m256 v_limit = _mm256_set1_ps(swiglu_limit);
+            const __m256 v_neg_limit = _mm256_set1_ps(-swiglu_limit);
+            v_gate = _mm256_min_ps(v_gate, v_limit);
+            v_up = _mm256_min_ps(_mm256_max_ps(v_up, v_neg_limit), v_limit);
+        }
 
         __m256 v_x = _mm256_mul_ps(v_gate, v_log2e);
 
@@ -511,7 +519,13 @@ static void act_fn(float* up, float* gate, int n) {
     }
 #else
     for (int i = 0; i < n; ++i) {
-        up[i] = up[i] * (gate[i] / (1.0f + expf(-gate[i])));
+        float gate_value = gate[i];
+        float up_value = up[i];
+        if (swiglu_limit > 0.0f) {
+            gate_value = std::min(gate_value, swiglu_limit);
+            up_value = std::min(std::max(up_value, -swiglu_limit), swiglu_limit);
+        }
+        up[i] = up_value * (gate_value / (1.0f + expf(-gate_value)));
     }
 #endif
 }
@@ -597,7 +611,7 @@ void MOE::forward_one(int k, const uint64_t* expert_ids, const float* weights, c
         void* up_proj_ptr = (uint8_t*)up_numa_[nid] +  (static_cast<int>(expert_id) * num_blocks  + offset) * stride_up_bytes_;
         llamafile_sgemm(n_stride, 1, config_.hidden_size / up_blk_size, up_proj_ptr, config_.hidden_size / up_blk_size, up_input_ptr, up_input_em, up_output_ptr, n_stride, 0, 1, GGML_TASK_TYPE_COMPUTE, config_.up_type, use_fp32_buffer_ ? GGML_TYPE_F32 : up_vec_dot_type, GGML_TYPE_F32, GGML_PREC_DEFAULT);
         #endif
-        act_fn(up_output_ptr, gate_output_ptr , n_stride);
+        act_fn(up_output_ptr, gate_output_ptr, n_stride, config_.swiglu_limit);
         if (config_.stride % down_vec_dot_blk_size == 0 && !use_fp32_buffer_) {
             void* down_input_ptr = s_down_input_ + (offsets_i + ith * config_.stride) * down_vec_dot_type_size / down_vec_dot_blk_size;
             from_float(up_output_ptr, down_input_ptr, n_stride, down_vec_dot_type);
@@ -1050,7 +1064,9 @@ void MOE::forward_many_m(int qlen, int k, const uint64_t* expert_ids, const floa
         #endif
 
         for(int i=0; i<n; i++){
-            act_fn(up_output_ptr + i*config_.intermediate_size, gate_output_ptr+ i*config_.intermediate_size , n_stride);
+            act_fn(up_output_ptr + i * config_.intermediate_size,
+                   gate_output_ptr + i * config_.intermediate_size,
+                   n_stride, config_.swiglu_limit);
             if(!use_fp32_buffer_){
                 if (config_.stride % down_vec_dot_blk_size == 0) {
                     void* down_input_ptr = down_input_ + ((expert_offsets + i) * config_.intermediate_size + ith * config_.stride) * down_vec_dot_type_size / down_vec_dot_blk_size;

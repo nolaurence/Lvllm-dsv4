@@ -627,30 +627,6 @@ class VllmConfig:
 
         from vllm.platforms import current_platform
 
-        # DSpark is implemented only by the V2 GPU model runner, and DeepSeek-V4
-        # is not otherwise a default-V2 architecture, so force V2 for it. If V2
-        # is unsupported for the rest of the config, _validate_v2_model_runner
-        # raises rather than silently falling back to V1 (which can't run dspark).
-        if (
-            self.speculative_config is not None
-            and self.speculative_config.method == "dspark"
-        ):
-            return True
-
-        # Mixed sliding/full DFlash drafts need multiple KV groups (V2 only);
-        # force V2 as for dspark, since a hybrid target otherwise defaults to V1.
-        if self._dflash_needs_multi_kv_group():
-            return True
-
-        # The DFlash2 candidate selector exists only in the V2 speculator. On V1
-        # the same checkpoint drafts through DFlashProposer, which never calls
-        # it, so the draft degrades to DFlash1 silently. Force V2 as for dspark.
-        if self._is_dflash2_draft():
-            return True
-
-        if self.model_config is not None and self.model_config.is_diffusion:
-            return True
-
         model_config = self.model_config
         if model_config is not None and current_platform.is_rocm():
             architectures = getattr(model_config, "architectures", ())
@@ -660,9 +636,6 @@ class VllmConfig:
                     ", ".join(architectures),
                 )
                 return False
-
-        if not self._is_default_v2_model_runner_model():
-            return False
 
         if not HAS_TRITON:
             logger.warning_once(
@@ -1566,22 +1539,29 @@ class VllmConfig:
                 and os.getenv("LVLLM_ENABLE_MOE_LAYERWISE_LOAD") == "1"
                 and self.compilation_config.cudagraph_mode != CUDAGraphMode.NONE
             ):
+                glm5_shared_expert_cpu = (
+                    os.getenv("LVLLM_GLM5_SHARED_EXPERT_CPU") == "1"
+                )
+                glm5_deferred_allreduce = (
+                    os.getenv("LVLLM_GLM5_DEFERRED_MOE_ALLREDUCE") == "1"
+                )
                 allow_lk_piecewise = (
-                    os.getenv("LVLLM_LK_MOE_ALLOW_PIECEWISE_CUDAGRAPH") == "1"
+                    glm5_shared_expert_cpu
+                    or glm5_deferred_allreduce
+                    or (os.getenv("LVLLM_LK_MOE_ALLOW_PIECEWISE_CUDAGRAPH") == "1")
                 )
                 allow_lk_full = (
                     os.getenv("LVLLM_LK_MOE_ALLOW_FULL_CUDAGRAPH") == "1"
+                    and not glm5_shared_expert_cpu
+                    and not glm5_deferred_allreduce
                 )
-                lk_decode_only = (
-                    os.getenv("LVLLM_LK_MOE_CUDAGRAPH_DECODE_ONLY") == "1"
-                )
+                lk_decode_only = os.getenv("LVLLM_LK_MOE_CUDAGRAPH_DECODE_ONLY") == "1"
                 lk_sync_decode_env = os.getenv("LVLLM_LK_CPU_DECODE_SYNC")
-                lk_sync_decode = (
-                    lk_sync_decode_env == "1"
-                    or (lk_sync_decode_env is None
-                        and self.parallel_config.tensor_parallel_size > 1)
+                lk_sync_decode = lk_sync_decode_env == "1" or (
+                    lk_sync_decode_env is None
+                    and self.parallel_config.tensor_parallel_size > 1
                 )
-                if lk_sync_decode:
+                if lk_sync_decode and not allow_lk_piecewise:
                     logger.warning_once(
                         "lk::MOE CPU layerwise offload is using synchronous "
                         "CPU decode bridge because %s. FULL CUDA graph decode "
@@ -1595,9 +1575,7 @@ class VllmConfig:
                         else "tensor_parallel_size > 1",
                         self.compilation_config.cudagraph_mode.name,
                     )
-                    self.compilation_config.cudagraph_mode = (
-                        CUDAGraphMode.NONE
-                    )
+                    self.compilation_config.cudagraph_mode = CUDAGraphMode.NONE
                 elif allow_lk_full:
                     logger.warning_once(
                         "lk::MOE CPU layerwise offload is enabled; keeping "
@@ -1608,14 +1586,19 @@ class VllmConfig:
                 elif allow_lk_piecewise:
                     logger.warning_once(
                         "lk::MOE CPU layerwise offload is enabled; using "
-                        "experimental PIECEWISE CUDA graph mode because "
-                        "LVLLM_LK_MOE_ALLOW_PIECEWISE_CUDAGRAPH=1. "
+                        "PIECEWISE CUDA graph mode with an eager LK CPU segment "
+                        "because %s. "
                         "Overriding cudagraph_mode from %s to PIECEWISE.",
+                        (
+                            "LVLLM_GLM5_SHARED_EXPERT_CPU=1"
+                            if glm5_shared_expert_cpu
+                            else "LVLLM_GLM5_DEFERRED_MOE_ALLREDUCE=1"
+                        )
+                        if glm5_shared_expert_cpu or glm5_deferred_allreduce
+                        else "LVLLM_LK_MOE_ALLOW_PIECEWISE_CUDAGRAPH=1",
                         self.compilation_config.cudagraph_mode.name,
                     )
-                    self.compilation_config.cudagraph_mode = (
-                        CUDAGraphMode.PIECEWISE
-                    )
+                    self.compilation_config.cudagraph_mode = CUDAGraphMode.PIECEWISE
                 elif lk_decode_only:
                     logger.warning_once(
                         "lk::MOE CPU layerwise offload is enabled; using "
@@ -1641,13 +1624,12 @@ class VllmConfig:
                     self.compilation_config.cudagraph_mode = (
                         CUDAGraphMode.FULL_AND_PIECEWISE
                     )
-                lk_max_cg_size = os.getenv(
-                    "LVLLM_LK_MOE_MAX_CUDAGRAPH_CAPTURE_SIZE")
-                if (lk_max_cg_size is not None
-                        and self.compilation_config.max_cudagraph_capture_size
-                        is None
-                        and self.compilation_config.cudagraph_capture_sizes
-                        is None):
+                lk_max_cg_size = os.getenv("LVLLM_LK_MOE_MAX_CUDAGRAPH_CAPTURE_SIZE")
+                if (
+                    lk_max_cg_size is not None
+                    and self.compilation_config.max_cudagraph_capture_size is None
+                    and self.compilation_config.cudagraph_capture_sizes is None
+                ):
                     try:
                         lk_max_cg_size_int = int(lk_max_cg_size)
                     except ValueError:

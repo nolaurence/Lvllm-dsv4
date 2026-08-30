@@ -1,6 +1,7 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 
+import os
 from typing import TYPE_CHECKING, Any, Literal
 
 import torch
@@ -71,6 +72,9 @@ from vllm.model_executor.layers.quantization.utils.w8a8_utils import (
     cutlass_fp8_supported,
     normalize_e4m3fn_to_e4m3fnuz,
 )
+from vllm.model_executor.model_loader.reload.layerwise import (
+    initialize_online_processing,
+)
 from vllm.model_executor.parameter import (
     BlockQuantScaleParameter,
     PerTensorScaleParameter,
@@ -88,6 +92,18 @@ if TYPE_CHECKING:
 ACTIVATION_SCHEMES = ["static", "dynamic"]
 
 logger = init_logger(__name__)
+
+
+def _lk_cpu_conversion_enabled(layer: torch.nn.Module) -> bool:
+    mode = os.getenv("LVLLM_MOE_USE_WEIGHT", "INT4").upper()
+    return bool(getattr(layer, "use_lk_moe", False)) and mode in {"INT4", "FP8"}
+
+
+def _fp8_moe_weight_device(layer: torch.nn.Module) -> torch.device | None:
+    if not _lk_cpu_conversion_enabled(layer):
+        return None
+    layer._vllm_layerwise_restore_device = torch.device("cpu")
+    return torch.device("meta")
 
 
 class Fp8Config(QuantizationConfig):
@@ -498,6 +514,11 @@ class Fp8MoEMethod(FusedMoEMethodBase):
         self.weight_scale_name = (
             "weight_scale_inv" if self.block_quant else "weight_scale"
         )
+        if _lk_cpu_conversion_enabled(layer) and not self.block_quant:
+            raise ValueError(
+                "LK CPU conversion requires block-scaled FP8 MoE weights; "
+                "per-tensor FP8 is not supported."
+            )
 
         # Set weight key and activation key for kernel compatibility
         if self.block_quant:
@@ -529,11 +550,18 @@ class Fp8MoEMethod(FusedMoEMethodBase):
         **extra_weight_attrs,
     ):
         layer.num_experts = num_experts
+        storage_num_experts = num_experts + int(
+            getattr(layer, "lk_extra_shared_experts", 0)
+        )
+        layer.lk_effective_num_experts = storage_num_experts
         layer.orig_dtype = params_dtype
         layer.weight_block_size = None
 
         assert self.quant_config.is_checkpoint_fp8_serialized
         params_dtype = torch.float8_e4m3fn
+        device = _fp8_moe_weight_device(layer)
+        if device is not None:
+            self.uses_meta_device = True
 
         if self.block_quant:
             assert self.weight_block_size is not None
@@ -564,10 +592,11 @@ class Fp8MoEMethod(FusedMoEMethodBase):
         # WEIGHTS
         w13_weight = torch.nn.Parameter(
             torch.empty(
-                num_experts,
+                storage_num_experts,
                 self.moe.w13_num_shards * intermediate_size_per_partition,
                 hidden_size,
                 dtype=params_dtype,
+                device=device,
             ),
             requires_grad=False,
         )
@@ -576,10 +605,11 @@ class Fp8MoEMethod(FusedMoEMethodBase):
 
         w2_weight = torch.nn.Parameter(
             torch.empty(
-                num_experts,
+                storage_num_experts,
                 hidden_size,
                 intermediate_size_per_partition,
                 dtype=params_dtype,
+                device=device,
             ),
             requires_grad=False,
         )
@@ -590,16 +620,22 @@ class Fp8MoEMethod(FusedMoEMethodBase):
         if self.moe.has_bias:
             w13_bias = torch.nn.Parameter(
                 torch.zeros(
-                    num_experts,
+                    storage_num_experts,
                     self.moe.w13_num_shards * intermediate_size_per_partition,
                     dtype=layer.orig_dtype,
+                    device=device,
                 ),
                 requires_grad=False,
             )
             layer.register_parameter("w13_bias", w13_bias)
             set_weight_attrs(w13_bias, extra_weight_attrs)
             w2_bias = torch.nn.Parameter(
-                torch.zeros(num_experts, hidden_size, dtype=layer.orig_dtype),
+                torch.zeros(
+                    storage_num_experts,
+                    hidden_size,
+                    dtype=layer.orig_dtype,
+                    device=device,
+                ),
                 requires_grad=False,
             )
             layer.register_parameter("w2_bias", w2_bias)
@@ -609,23 +645,30 @@ class Fp8MoEMethod(FusedMoEMethodBase):
         if not self.block_quant:
             # For per-tensor quant, the scales are per expert and weight.
             w13_scale_data = torch.ones(
-                num_experts, self.moe.w13_num_shards, dtype=torch.float32
+                storage_num_experts,
+                self.moe.w13_num_shards,
+                dtype=torch.float32,
+                device=device,
             )
-            w2_scale_data = torch.ones(num_experts, dtype=torch.float32)
+            w2_scale_data = torch.ones(
+                storage_num_experts, dtype=torch.float32, device=device
+            )
         else:
             # For block quant, the scales are per block (typically 128x128).
             w13_scale_data = torch.ones(
-                num_experts,
+                storage_num_experts,
                 self.moe.w13_num_shards
                 * ((intermediate_size_per_partition + block_n - 1) // block_n),
                 (hidden_size + block_k - 1) // block_k,
                 dtype=torch.float32,
+                device=device,
             )
             w2_scale_data = torch.ones(
-                num_experts,
+                storage_num_experts,
                 (hidden_size + block_n - 1) // block_n,
                 (intermediate_size_per_partition + block_k - 1) // block_k,
                 dtype=torch.float32,
+                device=device,
             )
         w13_weight_scale = torch.nn.Parameter(w13_scale_data, requires_grad=False)
         w2_weight_scale = torch.nn.Parameter(w2_scale_data, requires_grad=False)
@@ -647,13 +690,15 @@ class Fp8MoEMethod(FusedMoEMethodBase):
         if self.quant_config.activation_scheme == "static":
             assert not self.block_quant
             w13_input_scale = torch.nn.Parameter(
-                torch.ones(num_experts, dtype=torch.float32), requires_grad=False
+                torch.ones(storage_num_experts, dtype=torch.float32, device=device),
+                requires_grad=False,
             )
             layer.register_parameter("w13_input_scale", w13_input_scale)
             set_weight_attrs(w13_input_scale, extra_weight_attrs)
 
             w2_input_scale = torch.nn.Parameter(
-                torch.ones(num_experts, dtype=torch.float32), requires_grad=False
+                torch.ones(storage_num_experts, dtype=torch.float32, device=device),
+                requires_grad=False,
             )
             layer.register_parameter("w2_input_scale", w2_input_scale)
             set_weight_attrs(w2_input_scale, extra_weight_attrs)
@@ -661,6 +706,9 @@ class Fp8MoEMethod(FusedMoEMethodBase):
         else:
             layer.w13_input_scale = None
             layer.w2_input_scale = None
+
+        if _lk_cpu_conversion_enabled(layer):
+            initialize_online_processing(layer)
 
     def _setup_kernel(
         self,
@@ -703,6 +751,15 @@ class Fp8MoEMethod(FusedMoEMethodBase):
         )
 
     def process_weights_after_loading(self, layer: RoutedExperts) -> None:
+        if _lk_cpu_conversion_enabled(layer):
+            logger.info_once(
+                "Keeping block-FP8 MoE expert weights on CPU for LK layerwise "
+                "initialization."
+            )
+            self.moe_quant_config = None
+            self.moe_kernel = None
+            return
+
         # Allow for accessing weights and scales in standard way.
         w13 = layer.w13_weight
         w2 = layer.w2_weight

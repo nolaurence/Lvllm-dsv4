@@ -15,14 +15,21 @@ PYBIND11_MODULE(_lk_C, m) {
                          int intermediate_size, int stride, int group_min_len,
                          int group_max_len, intptr_t gate_proj,
                          intptr_t up_proj, intptr_t down_proj, int gate_type,
-                         int up_type, int down_type, int hidden_type) {
+                         int up_type, int down_type, int hidden_type,
+                         float swiglu_limit) {
             return MOEConfig(expert_num, routed_expert_num, hidden_size,
                              intermediate_size, stride, group_min_len,
                              group_max_len, (void *)gate_proj, (void *)up_proj,
                              (void *)down_proj, (ggml_type)gate_type,
                              (ggml_type)up_type, (ggml_type)down_type,
-                             (ggml_type)hidden_type);
-        }));
+                             (ggml_type)hidden_type, swiglu_limit);
+        }), py::arg("expert_num"), py::arg("routed_expert_num"),
+            py::arg("hidden_size"), py::arg("intermediate_size"),
+            py::arg("stride"), py::arg("group_min_len"),
+            py::arg("group_max_len"), py::arg("gate_proj"),
+            py::arg("up_proj"), py::arg("down_proj"), py::arg("gate_type"),
+            py::arg("up_type"), py::arg("down_type"), py::arg("hidden_type"),
+            py::arg("swiglu_limit") = 0.0f);
 
     py::class_<MOE>(m, "MOE")
         .def(py::init<MOEConfig>())
