@@ -764,7 +764,7 @@ void MOE::forward_one(int k, const uint64_t* expert_ids, const float* weights, c
 
         Backend_NUMA::getInstance().do_k_work_stealing_job(1, nth, nullptr, [&](int task_id) {
             int ith = task_id;
-            float * down_output_ptr_0 = s_down_output_ + ith * config_.stride;
+            float * down_output_ptr_0 = output_fp32_ + ith * config_.stride;
             for(int j=0; j<config_.stride; ++j){
                 down_output_ptr_0[j] = 0.0f;
             }

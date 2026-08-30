@@ -1985,6 +1985,44 @@ def test_vllm_config_explicit_overrides():
     assert config.compilation_config.cudagraph_mode == CUDAGraphMode.FULL_AND_PIECEWISE
 
 
+@pytest.mark.skipif(
+    not current_platform.support_static_graph_mode(),
+    reason="CUDA graph mode is disabled on this platform.",
+)
+@pytest.mark.parametrize(
+    ("weight_mode", "sync_decode", "expected_mode"),
+    [
+        ("INT4", None, CUDAGraphMode.FULL_DECODE_ONLY),
+        ("FP8", None, CUDAGraphMode.PIECEWISE),
+        ("INT4", "1", CUDAGraphMode.PIECEWISE),
+    ],
+)
+def test_lk_moe_full_decode_mode_resolution(
+    monkeypatch, weight_mode, sync_decode, expected_mode
+):
+    monkeypatch.setenv("LVLLM_MOE_NUMA_ENABLED", "1")
+    monkeypatch.setenv("LVLLM_ENABLE_MOE_LAYERWISE_LOAD", "1")
+    monkeypatch.setenv("LVLLM_GLM5_SHARED_EXPERT_CPU", "1")
+    monkeypatch.setenv("LVLLM_GLM5_DEFERRED_MOE_ALLREDUCE", "1")
+    monkeypatch.setenv("LVLLM_MOE_USE_WEIGHT", weight_mode)
+    if sync_decode is None:
+        monkeypatch.delenv("LVLLM_LK_CPU_DECODE_SYNC", raising=False)
+    else:
+        monkeypatch.setenv("LVLLM_LK_CPU_DECODE_SYNC", sync_decode)
+
+    config = VllmConfig(
+        parallel_config=ParallelConfig(tensor_parallel_size=2),
+        compilation_config=CompilationConfig(
+            mode=CompilationMode.VLLM_COMPILE,
+            cudagraph_mode=CUDAGraphMode.FULL_DECODE_ONLY,
+        ),
+    )
+
+    assert config.compilation_config.cudagraph_mode == expected_mode
+    if weight_mode == "INT4" and sync_decode is None:
+        assert os.environ["LVLLM_LK_CPU_DECODE_SYNC"] == "0"
+
+
 def test_fusion_pass_op_priority():
     """This test checks that custom op enablement & IR op priority
     correctly control default fusions"""

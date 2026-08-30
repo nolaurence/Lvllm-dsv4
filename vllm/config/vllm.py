@@ -1545,21 +1545,38 @@ class VllmConfig:
                 glm5_deferred_allreduce = (
                     os.getenv("LVLLM_GLM5_DEFERRED_MOE_ALLREDUCE") == "1"
                 )
-                allow_lk_piecewise = (
-                    glm5_shared_expert_cpu
-                    or glm5_deferred_allreduce
-                    or (os.getenv("LVLLM_LK_MOE_ALLOW_PIECEWISE_CUDAGRAPH") == "1")
+                lk_weight_mode = os.getenv("LVLLM_MOE_USE_WEIGHT", "INT4").upper()
+                lk_sync_decode_env = os.getenv("LVLLM_LK_CPU_DECODE_SYNC")
+                lk_int4_full_decode = (
+                    lk_weight_mode == "INT4"
+                    and self.compilation_config.cudagraph_mode
+                    == CUDAGraphMode.FULL_DECODE_ONLY
+                    and lk_sync_decode_env != "1"
                 )
-                allow_lk_full = (
-                    os.getenv("LVLLM_LK_MOE_ALLOW_FULL_CUDAGRAPH") == "1"
-                    and not glm5_shared_expert_cpu
-                    and not glm5_deferred_allreduce
+                if lk_int4_full_decode and lk_sync_decode_env is None:
+                    os.environ["LVLLM_LK_CPU_DECODE_SYNC"] = "0"
+                    lk_sync_decode_env = "0"
+                allow_lk_piecewise = lk_weight_mode == "FP8" or (
+                    not lk_int4_full_decode
+                    and (
+                        glm5_shared_expert_cpu
+                        or glm5_deferred_allreduce
+                        or (os.getenv("LVLLM_LK_MOE_ALLOW_PIECEWISE_CUDAGRAPH") == "1")
+                    )
+                )
+                allow_lk_full = lk_weight_mode == "INT4" and (
+                    lk_int4_full_decode
+                    or (
+                        os.getenv("LVLLM_LK_MOE_ALLOW_FULL_CUDAGRAPH") == "1"
+                        and not glm5_shared_expert_cpu
+                        and not glm5_deferred_allreduce
+                    )
                 )
                 lk_decode_only = os.getenv("LVLLM_LK_MOE_CUDAGRAPH_DECODE_ONLY") == "1"
-                lk_sync_decode_env = os.getenv("LVLLM_LK_CPU_DECODE_SYNC")
                 lk_sync_decode = lk_sync_decode_env == "1" or (
                     lk_sync_decode_env is None
                     and self.parallel_config.tensor_parallel_size > 1
+                    and not lk_int4_full_decode
                 )
                 if lk_sync_decode and not allow_lk_piecewise:
                     logger.warning_once(
@@ -1579,9 +1596,12 @@ class VllmConfig:
                 elif allow_lk_full:
                     logger.warning_once(
                         "lk::MOE CPU layerwise offload is enabled; keeping "
-                        "experimental cudagraph_mode=%s because "
-                        "LVLLM_LK_MOE_ALLOW_FULL_CUDAGRAPH=1.",
+                        "cudagraph_mode=%s with the capture-safe callback "
+                        "decode bridge because %s.",
                         self.compilation_config.cudagraph_mode.name,
+                        "LVLLM_MOE_USE_WEIGHT=INT4"
+                        if lk_int4_full_decode
+                        else "LVLLM_LK_MOE_ALLOW_FULL_CUDAGRAPH=1",
                     )
                 elif allow_lk_piecewise:
                     logger.warning_once(

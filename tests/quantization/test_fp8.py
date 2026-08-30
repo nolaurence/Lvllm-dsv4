@@ -225,6 +225,59 @@ def test_lk_fp8_block_conversion_packs_q4_and_cleans_source(
         assert param.dtype == torch.uint8
 
 
+def test_lk_q4_forward_one_preserves_first_expert(monkeypatch) -> None:
+    import vllm._lk_C as lk_C
+
+    monkeypatch.setenv("LK_FUSE_DECODE_DOWN_SUM", "0")
+    monkeypatch.setenv("LK_THREADS", "2")
+    num_experts = 2
+    hidden_size = 128
+    weight = torch.full(
+        (num_experts, hidden_size, hidden_size), 0.01, dtype=torch.float32
+    )
+    gate_q4 = torch.stack(
+        [LkRoutedExperts._quantize_rows_q4_0(item) for item in weight]
+    )
+    up_q4 = gate_q4.clone()
+    down_q4 = gate_q4.clone()
+    config = lk_C.MOEConfig(
+        num_experts,
+        1,
+        hidden_size,
+        hidden_size,
+        hidden_size,
+        2,
+        2,
+        gate_q4.data_ptr(),
+        up_q4.data_ptr(),
+        down_q4.data_ptr(),
+        2,
+        2,
+        2,
+        30,
+        0.0,
+    )
+    moe = lk_C.MOE(config)
+    expert_ids = torch.tensor([0], dtype=torch.int64)
+    expert_weights = torch.tensor([1.0], dtype=torch.float32)
+    hidden_states = torch.ones((1, hidden_size), dtype=torch.bfloat16)
+    output = torch.empty_like(hidden_states)
+    batch_size = torch.tensor([1], dtype=torch.int32)
+
+    moe.forward(
+        1,
+        1,
+        expert_ids.data_ptr(),
+        expert_weights.data_ptr(),
+        hidden_states.data_ptr(),
+        output.data_ptr(),
+        batch_size.data_ptr(),
+    )
+
+    assert torch.isfinite(output).all()
+    assert torch.count_nonzero(output).item() == hidden_size
+
+
 @pytest.mark.parametrize("weight_mode", ["INT4", "FP8"])
 def test_fp8_lk_glm_shared_expert_allocates_extra_slot(
     monkeypatch, weight_mode

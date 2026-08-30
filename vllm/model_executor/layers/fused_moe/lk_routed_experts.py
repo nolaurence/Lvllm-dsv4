@@ -31,6 +31,23 @@ def _malloc_trim() -> None:
         ctypes.CDLL(None).malloc_trim(0)
 
 
+def _is_cuda_stream_capturing(tensor: torch.Tensor) -> bool:
+    return tensor.is_cuda and torch.cuda.is_current_stream_capturing()
+
+
+def _should_use_lk_sync_decode(
+    sync_decode_env: str | None,
+    tp_size: int,
+    has_sync_method: bool,
+    stream_is_capturing: bool,
+) -> bool:
+    return (
+        (sync_decode_env == "1" or (sync_decode_env is None and tp_size > 1))
+        and not stream_is_capturing
+        and has_sync_method
+    )
+
+
 def _parse_layer_set(spec: str) -> set[int]:
     layers: set[int] = set()
     for item in spec.split(","):
@@ -867,9 +884,13 @@ class LkRoutedExperts(RoutedExperts):
             )
         sync_decode_env = os.getenv("LVLLM_LK_CPU_DECODE_SYNC")
         sync_method = "cpu_decode_sync_i32" if use_i32_ids else "cpu_decode_sync"
-        use_sync_decode = (
-            sync_decode_env == "1" or (sync_decode_env is None and self.tp_size > 1)
-        ) and hasattr(self.lk_moe, sync_method)
+        stream_is_capturing = _is_cuda_stream_capturing(hidden_states)
+        use_sync_decode = _should_use_lk_sync_decode(
+            sync_decode_env,
+            self.tp_size,
+            hasattr(self.lk_moe, sync_method),
+            stream_is_capturing,
+        )
         if use_sync_decode:
             decode_fn = getattr(self.lk_moe, sync_method)
         else:
@@ -1037,17 +1058,20 @@ class LkRoutedExperts(RoutedExperts):
         mapped_topk_ids: torch.Tensor,
         output: torch.Tensor,
     ) -> torch.Tensor:
-        effective_num_experts = self.local_num_experts + self.lk_extra_shared_experts
-        invalid_mask = (mapped_topk_ids < 0) | (
-            mapped_topk_ids >= effective_num_experts
-        )
-        if torch.any(invalid_mask):
-            invalid = mapped_topk_ids[invalid_mask][:16].detach().cpu().tolist()
-            raise RuntimeError(
-                f"lk::MOE got out-of-range expert ids for layer "
-                f"{self.layer_name}: {invalid}; effective_num_experts="
-                f"{effective_num_experts}"
+        if not _is_cuda_stream_capturing(mapped_topk_ids):
+            effective_num_experts = (
+                self.local_num_experts + self.lk_extra_shared_experts
             )
+            invalid_mask = (mapped_topk_ids < 0) | (
+                mapped_topk_ids >= effective_num_experts
+            )
+            if torch.any(invalid_mask):
+                invalid = mapped_topk_ids[invalid_mask][:16].detach().cpu().tolist()
+                raise RuntimeError(
+                    f"lk::MOE got out-of-range expert ids for layer "
+                    f"{self.layer_name}: {invalid}; effective_num_experts="
+                    f"{effective_num_experts}"
+                )
         result = self._forward_lk_cuda_decode(
             hidden_states,
             topk_weights,

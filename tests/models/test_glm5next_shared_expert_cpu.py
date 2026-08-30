@@ -10,6 +10,7 @@ from torch import nn
 from vllm.model_executor.layers.fused_moe.lk_routed_experts import (
     LkRoutedExperts,
     _glm5_lk_shared_expert_count,
+    _should_use_lk_sync_decode,
 )
 from vllm.models.glm5next.nvidia.model import (
     Glm5NextDecoderLayer,
@@ -348,6 +349,53 @@ def test_lk_piecewise_entry_writes_stable_output(monkeypatch):
 
     assert actual.data_ptr() == output.data_ptr()
     torch.testing.assert_close(actual, expected)
+
+
+def test_lk_full_capture_skips_dynamic_expert_id_validation(monkeypatch):
+    import vllm.model_executor.layers.fused_moe.lk_routed_experts as lk_module
+
+    layer = object.__new__(LkRoutedExperts)
+    nn.Module.__init__(layer)
+    layer.local_num_experts = 1
+    layer.lk_extra_shared_experts = 0
+    layer.layer_name = "test"
+    hidden_states = torch.randn(1, 8)
+    weights = torch.ones(1, 1)
+    ids = torch.full((1, 1), 7, dtype=torch.int32)
+    output = torch.empty_like(hidden_states)
+
+    monkeypatch.setattr(lk_module, "_is_cuda_stream_capturing", lambda _tensor: True)
+    monkeypatch.setattr(
+        layer,
+        "_forward_lk_cuda_decode",
+        MethodType(lambda self, *_args, output=None: output, layer),
+    )
+
+    actual = layer._forward_lk_cuda_decode_into(hidden_states, weights, ids, output)
+
+    assert actual.data_ptr() == output.data_ptr()
+
+
+@pytest.mark.parametrize(
+    ("sync_env", "tp_size", "capturing", "expected"),
+    [
+        (None, 2, False, True),
+        (None, 2, True, False),
+        ("1", 2, True, False),
+        ("0", 2, False, False),
+        (None, 1, False, False),
+    ],
+)
+def test_lk_full_capture_uses_callback_decode(sync_env, tp_size, capturing, expected):
+    assert (
+        _should_use_lk_sync_decode(
+            sync_env,
+            tp_size,
+            has_sync_method=True,
+            stream_is_capturing=capturing,
+        )
+        is expected
+    )
 
 
 def test_kt_fp8_piecewise_entry_writes_stable_output(monkeypatch):
