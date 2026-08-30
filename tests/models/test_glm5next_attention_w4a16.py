@@ -7,11 +7,9 @@ import pytest
 import torch
 from torch import nn
 
-from vllm.model_executor.layers.quantization.fp8 import Fp8Config
 from vllm.models.glm5next.nvidia import attention as attention_module
 from vllm.models.glm5next.nvidia import kda as kda_module
 from vllm.models.glm5next.nvidia.quantization import (
-    Glm5NextAttentionW4A16Config,
     get_glm5_next_attention_quant_config,
 )
 
@@ -31,29 +29,13 @@ class _FakeLinear(nn.Module):
         return x, None
 
 
-def test_glm5_attention_w4a16_config(monkeypatch):
-    checkpoint_config = Fp8Config(
-        is_checkpoint_fp8_serialized=True,
-        weight_block_size=[128, 128],
-    )
+def test_glm5_attention_w4a16_fails_closed(monkeypatch):
     monkeypatch.delenv("LVLLM_GLM5_ATTN_W4A16", raising=False)
-    assert get_glm5_next_attention_quant_config(checkpoint_config) is None
+    assert get_glm5_next_attention_quant_config() is None
 
     monkeypatch.setenv("LVLLM_GLM5_ATTN_W4A16", "1")
-    config = get_glm5_next_attention_quant_config(checkpoint_config)
-    assert isinstance(config, Glm5NextAttentionW4A16Config)
-    assert config.checkpoint_quant_config is checkpoint_config
-    assert config.checkpoint_weights_are_fp8
-
-    kda_config = get_glm5_next_attention_quant_config(
-        checkpoint_config,
-        checkpoint_weights_are_fp8=False,
-    )
-    assert isinstance(kda_config, Glm5NextAttentionW4A16Config)
-    assert not kda_config.checkpoint_weights_are_fp8
-
-    with pytest.raises(RuntimeError, match="requires an FP8 checkpoint"):
-        get_glm5_next_attention_quant_config(None)
+    with pytest.raises(RuntimeError, match="single-token decode collapse"):
+        get_glm5_next_attention_quant_config()
 
 
 def test_glm5_kda_w4a16_keeps_recurrent_stack_unquantized(monkeypatch):
@@ -101,17 +83,16 @@ def test_glm5_kda_w4a16_keeps_recurrent_stack_unquantized(monkeypatch):
         linear_lower_bound=-5.0,
     )
 
-    attention_quant_config = object()
     kda_module.Glm5NextLinearAttention(
         config,
         vllm_config,
-        quant_config=attention_quant_config,
+        quant_config=None,
         prefix="model.layers.0.self_attn",
     )
 
     configs = {prefix.rsplit(".", 1)[-1]: quant for prefix, quant in _FakeLinear.calls}
     for name in ("in_proj_qkvbfg_a", "f_b_proj", "g_b_proj", "o_proj"):
-        assert configs[name] is attention_quant_config
+        assert configs[name] is None
     for name in ("q_conv1d", "k_conv1d", "v_conv1d"):
         assert configs[name] is None
     assert vllm_config.quant_config is checkpoint_quant_config
@@ -129,7 +110,7 @@ def _fake_gdn_init(self, config, vllm_config, prefix):
     self.num_spec = 0
 
 
-def test_glm5_mla_w4a16_quantizes_attention_projections(monkeypatch):
+def test_glm5_mla_keeps_attention_projections_unquantized(monkeypatch):
     _FakeLinear.calls = []
     indexer_configs = []
     wrapper_configs = []
@@ -176,7 +157,6 @@ def test_glm5_mla_w4a16_quantizes_attention_projections(monkeypatch):
         rope_parameters={"rope_type": "default"},
     )
 
-    attention_quant_config = object()
     attention_module.Glm5NextMLAAttention(
         vllm_config=SimpleNamespace(),
         config=config,
@@ -187,7 +167,7 @@ def test_glm5_mla_w4a16_quantizes_attention_projections(monkeypatch):
         v_head_dim=256,
         q_lora_rank=1536,
         kv_lora_rank=512,
-        quant_config=attention_quant_config,
+        quant_config=None,
         cache_config=None,
         prefix="model.layers.3.self_attn",
         topk_indices_buffer=None,
@@ -196,6 +176,6 @@ def test_glm5_mla_w4a16_quantizes_attention_projections(monkeypatch):
 
     configs = {prefix.rsplit(".", 1)[-1]: quant for prefix, quant in _FakeLinear.calls}
     for name in ("fused_qkv_a_proj", "q_b_proj", "kv_b_proj", "o_proj"):
-        assert configs[name] is attention_quant_config
-    assert indexer_configs == [attention_quant_config]
-    assert wrapper_configs == [attention_quant_config]
+        assert configs[name] is None
+    assert indexer_configs == [None]
+    assert wrapper_configs == [None]

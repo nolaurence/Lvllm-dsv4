@@ -495,7 +495,7 @@ vllm serve \
 | 环境变量 | 类型 | 默认值 | 说明 | 备注 |
 |--------|------|--------|------|------|
 | `LVLLM_MOE_NUMA_ENABLED` | 核心参数 | `0` | 是否启用混合推理: `1`-启用，`0`-禁用 | 设置为`0`禁用混合推理，行为与vLLM相同 |
-| `LVLLM_GLM5_ATTN_W4A16` | 精度/性能参数 | `0` | 将GLM-5 GPU attention投影在线转换为MXFP4/A16 | 可节省约4 GiB/卡；KDA和sparse MLA W4均可能导致decode重复循环，仅用于高吞吐实验 |
+| `LVLLM_GLM5_ATTN_W4A16` | 禁用参数 | `0` | GLM-5 attention W4A16兼容开关 | 设为`1`会fail-closed；KDA和sparse MLA W4均复现单token decode塌缩 |
 | `LVLLM_GLM5_SHARED_EXPERT_CPU` | GPU显存参数 | `0` | 将GLM-5 shared expert追加到LK CPU MoE中计算 | 仅支持单个shared expert、EP1且无GPU常驻MoE层 |
 | `LVLLM_GLM5_DEFERRED_MOE_ALLREDUCE` | 实验性能参数 | `0` | 将GLM-5 MoE的TP all-reduce延迟到下一层mHC入口 | 本地实验路径，非KTransformers GLM实现；要求PIECEWISE CUDA Graph、TP>1、EP/SP/DBO关闭 |
 | `LVLLM_LK_MOE_ALLOW_PIECEWISE_CUDAGRAPH` | 性能参数 | `0` | 在LK CPU eager段前后捕获PIECEWISE CUDA Graph | 必须使用固定输出buffer；不会启用GLM mHC all-reduce融合 |
