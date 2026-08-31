@@ -504,8 +504,14 @@ def compute_kpool_tail_slot_mapping(
     num_reqs: int,
     kpool: int,
 ) -> torch.Tensor:
-    """Map every token to its request's one circular tail block."""
-    out = slot_mapping.clone()
+    """Map every token to its request's one circular tail block.
+
+    Entries past ``num_actual_tokens`` (cudagraph padding) are filled with -1
+    (invalid slot) rather than cloned from ``slot_mapping``: that buffer is
+    reused across steps, so its tail holds stale or uninitialized values that
+    would index past the tail cache in the seed/update kernels (MMU fault).
+    """
+    out = torch.full_like(slot_mapping, -1)
     if num_actual_tokens == 0:
         return out
     tokens = torch.arange(num_actual_tokens, device=slot_mapping.device)

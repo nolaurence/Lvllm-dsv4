@@ -384,6 +384,53 @@ def test_leading_invalid_tail_slot():
     _assert_eq(r_ref, r_kern)
 
 
+@pytest.mark.skipif(current_platform.is_rocm(), reason="NVIDIA guard")
+def test_prefill_seed_ignores_out_of_range_tail_slots():
+    key = torch.randn(2, HEAD_DIM, dtype=torch.bfloat16, device="cuda")
+    score = torch.randn_like(key)
+    tail_slot = torch.tensor(
+        [NUM_BLOCKS * POOL_SIZE, 1831800323], dtype=torch.int32, device="cuda"
+    )
+    _, tail = _make_caches()
+    before = tail.clone()
+
+    kpool_seed_tail_cache(tail, key, score, tail_slot, POOL_SIZE, HEAD_DIM)
+    torch.accelerator.synchronize()
+
+    assert torch.equal(tail, before)
+
+
+@pytest.mark.skipif(current_platform.is_rocm(), reason="NVIDIA guard")
+def test_decode_ignores_out_of_range_tail_slot():
+    kv, tail = _make_caches()
+    kv_before = kv.clone()
+    tail_before = tail.clone()
+    tail_slot = torch.tensor([[1831800323]], dtype=torch.int32, device="cuda")
+    key = torch.randn(1, 1, HEAD_DIM, dtype=torch.bfloat16, device="cuda")
+    score = torch.randn_like(key)
+    ape = torch.randn(POOL_SIZE, HEAD_DIM, dtype=torch.float32, device="cuda")
+    slot_map = torch.zeros((1, 1), dtype=torch.int32, device="cuda")
+    pos = torch.full((1, 1), POOL_SIZE - 1, dtype=torch.int32, device="cuda")
+
+    kpool_decode_update_and_maybe_write_cache_batched(
+        kv,
+        tail,
+        tail_slot,
+        key,
+        score,
+        ape,
+        slot_map,
+        pos,
+        POOL_SIZE,
+        HEAD_DIM,
+        round_scale=ROUND_SCALE,
+    )
+    torch.accelerator.synchronize()
+
+    assert torch.equal(kv, kv_before)
+    assert torch.equal(tail, tail_before)
+
+
 @pytest.mark.skipif(not current_platform.is_rocm(), reason="ROCm required")
 def test_amd_prefill_seed_honors_padded_tail_block_stride():
     """The tail shares a padded indexer allocation in production."""

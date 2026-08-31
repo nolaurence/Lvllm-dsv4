@@ -193,6 +193,36 @@ def test_circular_mapping_preserves_padding_and_empty_batch():
     assert torch.equal(empty, slot_mapping)
 
 
+def test_circular_mapping_discards_stale_padding_from_reused_buffer():
+    """``common_attn_metadata.slot_mapping`` is a persistent buffer reused
+    across steps; entries past ``num_actual_tokens`` hold stale/uninitialized
+    values. They must not leak into the tail metadata: the seed kernel treats
+    any non-negative slot as valid and a stale giant id writes far past the
+    tail cache (observed as a Warp MMU Fault killing the engine)."""
+    own_blocks = [5, 9]
+    per_req = [list(range(10)), list(range(12))]
+    positions, qsl, slot_mapping, num_actual, num_reqs = make_batch(per_req)
+    bt = make_tail_block_table(own_blocks)
+    # Values observed in the engine-dead crash: huge positives and negatives.
+    garbage_tail = torch.tensor(
+        [1831800323, -915931136, 128707, 42, 0, 7, -(2**31), 2**31 - 1],
+        dtype=slot_mapping.dtype,
+    )
+    slot_mapping = torch.cat([slot_mapping, garbage_tail])
+
+    out = circular_tail_slots(slot_mapping, bt, qsl, positions, num_actual, num_reqs)
+    assert out.shape == slot_mapping.shape
+    # Real tokens still map onto their own block; the garbage tail is dropped.
+    off = 0
+    for req, prompt in enumerate(per_req):
+        for pos in range(len(prompt)):
+            slot = int(out[off + pos])
+            assert slot // KPOOL == own_blocks[req]
+            assert slot % KPOOL == pos % KPOOL
+        off += len(prompt)
+    assert torch.equal(out[num_actual:], torch.full_like(out[num_actual:], -1))
+
+
 def make_common_metadata(per_req_positions, own_blocks, with_positions=True):
     positions, qsl, slot_mapping, num_actual, num_reqs = make_batch(
         per_req_positions, padded_len=sum(len(p) for p in per_req_positions) + 4

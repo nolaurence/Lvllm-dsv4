@@ -458,6 +458,7 @@ def _kpool_tail_seed_kernel(
     tslot_ptr,
     tail_ptr,
     n_tokens,
+    NUM_BLOCKS,
     HEAD_DIM: tl.constexpr,
     KPOOL: tl.constexpr,
     BLOCK_D: tl.constexpr,
@@ -474,6 +475,9 @@ def _kpool_tail_seed_kernel(
     if t < 0:
         return
     blk = t // KPOOL  # t >= 0 here, so trunc == floor
+    # Defensive: a corrupted/upstream-stale slot must never write OOB.
+    if blk >= NUM_BLOCKS:
+        return
     ahead = tl.load(tslot_ptr + i + KPOOL, mask=i + KPOOL < n_tokens, other=-1).to(
         tl.int64
     )
@@ -511,6 +515,7 @@ def kpool_seed_tail_cache(
         tslot,
         tail_kv_cache,
         n,
+        tail_kv_cache.shape[0],
         HEAD_DIM=head_dim,
         KPOOL=kpool,
         BLOCK_D=triton.next_power_of_2(head_dim),
@@ -537,6 +542,7 @@ def _kpool_decode_update_batched_kernel(
     slot_mapping_ptr,  # [B, NEXT_N] int32
     positions_ptr,  # [B, NEXT_N] int32
     NEXT_N,  # runtime token count per request (no .item() needed)
+    NUM_TAIL_BLOCKS,
     PAGE_SIZE: tl.constexpr,
     BUF_NUMEL_PER_PAGE: tl.constexpr,
     POOL_SIZE: tl.constexpr,
@@ -577,11 +583,12 @@ def _kpool_decode_update_batched_kernel(
         # Derive the tail block from THIS token's tail_slot (the request's block
         # is constant across a pool, but a padded / invalid entry carries a
         # negative sentinel -- reading it from token 0 would poison every
-        # token's base address). Clamp so an invalid entry can never form an
-        # out-of-bounds base; the accesses below are gated on pos_valid anyway.
+        # token's base address). Clamp the address calculation and gate every
+        # tail access on the physical block range.
         tail_slot = tl.load(tail_slot_mapping_ptr + idx)
         block = tl.maximum(tail_slot, 0).to(tl.int64) // POOL_SIZE
         block_base = block * TAIL_BLOCK_ELEMS
+        tail_block_valid = (tail_slot >= 0) & (block < NUM_TAIL_BLOCKS)
 
         # The tail-ring stash must run for EVERY real token, so it is gated on
         # the token-granular tail slot -- not on `pos_valid`, which keys off the
@@ -589,7 +596,7 @@ def _kpool_decode_update_batched_kernel(
         # last token. Gating the stash on pos_valid dropped every intra-pool
         # token, so a decode-built pool compressed 3 stale ring entries (the
         # prefill-seeded prompt tail, frozen forever) plus the current token.
-        stash_valid = (pos >= 0) & (tail_slot >= 0)
+        stash_valid = (pos >= 0) & tail_block_valid
 
         key = tl.load(
             key_ptr + req * key_stride_b + t * key_stride_t + offs,
@@ -602,7 +609,7 @@ def _kpool_decode_update_batched_kernel(
             other=0.0,
         ).to(tl.float32)
 
-        if pos_valid & (slot == POOL_SIZE - 1):
+        if pos_valid & tail_block_valid & (slot == POOL_SIZE - 1):
             pool_logical_start = safe_pos - slot
 
             max_score = tl.full((BLOCK_D,), -float("inf"), tl.float32)
@@ -776,6 +783,7 @@ def kpool_decode_update_and_maybe_write_cache_batched(
         slot_mapping,
         positions,
         next_n,
+        tail_kv_cache.shape[0],
         PAGE_SIZE=page_size,
         BUF_NUMEL_PER_PAGE=buf.stride(0),
         POOL_SIZE=pool_size,
