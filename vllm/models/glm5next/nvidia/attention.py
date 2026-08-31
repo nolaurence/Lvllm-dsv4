@@ -296,11 +296,16 @@ class Indexer(nn.Module):
             cache_config=cache_config,
             index_kpool=self.index_kpool,
         )
-        self.max_model_len = vllm_config.model_config.max_model_len
+        # The indexer stores one state per kpool tokens. Keep its logits and
+        # gather workspaces in pool units; the selected indices are expanded
+        # back to token units before sparse attention consumes them.
+        self.max_model_len = vllm_config.model_config.max_model_len // self.index_kpool
         self.prefix = prefix
         from vllm.v1.attention.backends.mla.indexer import get_max_prefill_buffer_size
 
-        self.max_total_seq_len = get_max_prefill_buffer_size(vllm_config)
+        self.max_total_seq_len = (
+            get_max_prefill_buffer_size(vllm_config) // self.index_kpool
+        )
         self.indexer_op = SparseAttnIndexerKpool(
             self.k_cache,
             self.quant_block_size,

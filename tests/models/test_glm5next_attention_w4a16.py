@@ -97,6 +97,7 @@ def test_glm5_kda_w4a16_keeps_recurrent_stack_unquantized(monkeypatch):
         assert configs[name] is None
     assert vllm_config.quant_config is checkpoint_quant_config
 
+
 def _fake_gdn_init(self, config, vllm_config, prefix):
     nn.Module.__init__(self)
     self.prefix = prefix
@@ -179,3 +180,56 @@ def test_glm5_mla_keeps_attention_projections_unquantized(monkeypatch):
         assert configs[name] is None
     assert indexer_configs == [None]
     assert wrapper_configs == [None]
+
+
+def test_glm5_kpool_indexer_sizes_workspace_in_pool_units(monkeypatch):
+    captured = []
+
+    class FakeCache:
+        def __init__(self, **kwargs):
+            self.prefix = kwargs["prefix"]
+            self.kv_cache = None
+
+    monkeypatch.setattr(attention_module, "ReplicatedLinear", _FakeLinear)
+    monkeypatch.setattr(attention_module, "MergedColumnParallelLinear", _FakeLinear)
+    monkeypatch.setattr(
+        attention_module, "LayerNorm", lambda *args, **kwargs: nn.Identity()
+    )
+    monkeypatch.setattr(attention_module, "Glm5NextIndexerCache", FakeCache)
+    monkeypatch.setattr(attention_module, "Glm5NextTailCache", FakeCache)
+    monkeypatch.setattr(
+        attention_module,
+        "SparseAttnIndexerKpool",
+        lambda *args, **kwargs: captured.append(args) or nn.Identity(),
+    )
+
+    max_model_len = 1_048_576
+    index_kpool = 4
+    config = SimpleNamespace(
+        index_topk=2048,
+        index_n_heads=32,
+        index_head_dim=128,
+        index_kpool=index_kpool,
+        qk_rope_head_dim=0,
+    )
+    vllm_config = SimpleNamespace(
+        model_config=SimpleNamespace(max_model_len=max_model_len)
+    )
+
+    indexer = attention_module.Indexer(
+        vllm_config=vllm_config,
+        config=config,
+        hidden_size=4096,
+        q_lora_rank=1536,
+        quant_config=None,
+        cache_config=SimpleNamespace(),
+        topk_indices_buffer=torch.empty(1, 2176, dtype=torch.int32),
+        prefix="model.layers.3.self_attn.indexer",
+    )
+
+    assert indexer.max_model_len == max_model_len // index_kpool
+    assert indexer.max_total_seq_len == max_model_len * 40 // index_kpool
+    assert captured[0][5:7] == (
+        indexer.max_model_len,
+        indexer.max_total_seq_len,
+    )
