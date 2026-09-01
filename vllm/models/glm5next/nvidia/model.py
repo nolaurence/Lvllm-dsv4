@@ -473,13 +473,9 @@ class Glm5NextDecoderLayer(nn.Module):
             else (mlp_layer_types[-1] if mlp_layer_types else "sparse")
         )
         if self.is_moe and self.num_experts is not None and mlp_type == "sparse":
-            if is_mtp_layer and (
-                envs.LVLLM_GLM5_SHARED_EXPERT_CPU
-                or envs.LVLLM_GLM5_DEFERRED_MOE_ALLREDUCE
-            ):
+            if is_mtp_layer and envs.LVLLM_GLM5_DEFERRED_MOE_ALLREDUCE:
                 raise RuntimeError(
-                    "GLM shared-expert CPU fusion and deferred MoE all-reduce "
-                    "do not yet support MTP layers"
+                    "GLM deferred MoE all-reduce does not yet support MTP layers"
                 )
             self.mlp = Glm5NextMoE(
                 config=config,

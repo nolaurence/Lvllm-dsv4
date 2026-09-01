@@ -31,6 +31,7 @@ from .model import (
     Glm5NextMoE,
     _try_load_fp8_attn_proj,
     _try_load_fp8_indexer_wk,
+    _try_load_glm5_lk_shared_expert,
     get_spec_layer_idx_from_weight_name,
 )
 from .ops.fused_eh_norm import fused_eh_norm
@@ -326,6 +327,16 @@ class Glm5NextMTP(nn.Module, DeepseekV2MixtureOfExperts):
             if spec_layer is None:
                 continue
             name = self._rewrite_spec_layer_name(spec_layer, name)
+
+            shared_param_name = _try_load_glm5_lk_shared_expert(
+                name,
+                loaded_weight,
+                params_dict,
+                shared_expert_id=self.config.n_routed_experts,
+            )
+            if shared_param_name is not None:
+                loaded_params.add(shared_param_name)
+                continue
 
             if _try_load_fp8_indexer_wk(
                 name,

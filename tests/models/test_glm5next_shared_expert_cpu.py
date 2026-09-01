@@ -19,6 +19,7 @@ from vllm.models.glm5next.nvidia.model import (
     _validate_glm5_deferred_moe_allreduce,
     _validate_glm5_shared_expert_cpu,
 )
+from vllm.models.glm5next.nvidia.mtp import Glm5NextMTP
 
 
 @pytest.mark.parametrize(
@@ -114,6 +115,92 @@ def test_glm5_text_config_enables_lk_shared_expert(monkeypatch):
     )
 
     assert _glm5_lk_shared_expert_count() == 1
+
+
+def test_glm5_mtp_allows_cpu_shared_expert(monkeypatch):
+    import vllm.models.glm5next.nvidia.model as model_module
+
+    class FakeMoE(nn.Module):
+        def __init__(self, **_kwargs):
+            super().__init__()
+            self.defer_moe_allreduce = False
+
+    monkeypatch.setattr(
+        model_module, "Glm5NextLinearAttention", lambda **_kwargs: nn.Identity()
+    )
+    monkeypatch.setattr(model_module, "Glm5NextMoE", FakeMoE)
+    monkeypatch.setattr(
+        model_module, "RMSNorm", lambda *_args, **_kwargs: nn.Identity()
+    )
+    monkeypatch.setenv("LVLLM_GLM5_SHARED_EXPERT_CPU", "1")
+    monkeypatch.setenv("LVLLM_GLM5_DEFERRED_MOE_ALLREDUCE", "0")
+    config = SimpleNamespace(
+        hidden_size=8,
+        is_moe=True,
+        num_hidden_layers=45,
+        rms_norm_eps=1e-5,
+        n_routed_experts=288,
+        mhc=True,
+        is_kda_layer=lambda _layer_idx: True,
+        mlp_layer_types=["dense"] * 3 + ["sparse"] * 42,
+    )
+    vllm_config = SimpleNamespace(
+        cache_config=None,
+        quant_config=None,
+        parallel_config=SimpleNamespace(use_sequence_parallel_moe=False),
+    )
+
+    layer = Glm5NextDecoderLayer(
+        vllm_config,
+        config,
+        layer_idx=45,
+        prefix="model.layers.45.mtp_block",
+        is_mtp_layer=True,
+    )
+
+    assert isinstance(layer.mlp, FakeMoE)
+
+
+def test_glm5_mtp_loads_shared_expert_into_lk_extra_slot(monkeypatch):
+    import vllm.models.glm5next.nvidia.mtp as mtp_module
+
+    monkeypatch.setenv("LVLLM_GLM5_SHARED_EXPERT_CPU", "1")
+    checkpoint_name = (
+        "model.language_model.layers.45.mlp.shared_experts.gate_proj.weight"
+    )
+    mapped_name = "model.layers.45.mtp_block.mlp.experts.routed_experts.w13_weight"
+    calls = []
+    param = nn.Parameter(torch.empty(1))
+    param.weight_loader = lambda *args, **kwargs: calls.append((args, kwargs))
+    loaded_weight = torch.randn(2, 2)
+    mtp = object.__new__(Glm5NextMTP)
+    nn.Module.__init__(mtp)
+    mtp.config = SimpleNamespace(
+        n_routed_experts=288,
+        num_hidden_layers=45,
+        num_nextn_predict_layers=1,
+        mla_nope=True,
+        qk_rope_head_dim=4,
+    )
+    mtp.model = SimpleNamespace(mtp_start_layer_idx=45, num_mtp_layers=1)
+    monkeypatch.setattr(
+        Glm5NextMTP,
+        "named_parameters",
+        lambda _self: [(mapped_name, param)],
+    )
+    monkeypatch.setattr(
+        mtp_module,
+        "fused_moe_make_expert_params_mapping",
+        lambda *_args, **_kwargs: [],
+    )
+
+    loaded_params = mtp.load_weights([(checkpoint_name, loaded_weight)])
+
+    assert loaded_params == {mapped_name}
+    assert len(calls) == 1
+    args, kwargs = calls[0]
+    assert args == (param, loaded_weight, mapped_name)
+    assert kwargs == {"expert_id": 288, "shard_id": "w1"}
 
 
 def test_glm5_deferred_moe_allreduce_validation(monkeypatch):
@@ -399,7 +486,7 @@ def test_lk_full_capture_uses_callback_decode(sync_env, tp_size, capturing, expe
 
 
 def test_kt_fp8_piecewise_entry_writes_stable_output(monkeypatch):
-    buffers = {}
+    buffers: dict[tuple[str, tuple[int, ...], torch.dtype], torch.Tensor] = {}
 
     class FakeMoe:
         def forward_task(self, _bsz, k, _ids, _weights, _input, _output, incremental):
@@ -446,7 +533,7 @@ def test_kt_fp8_piecewise_entry_writes_stable_output(monkeypatch):
 
 
 def test_kt_fp8_piecewise_entry_chunks_prefill(monkeypatch):
-    buffers = {}
+    buffers: dict[tuple[str, tuple[int, ...], torch.dtype], torch.Tensor] = {}
     chunk_sizes = []
     cursor = 0
 
@@ -516,7 +603,7 @@ def test_lk_cpu_fallback_includes_shared_expert_in_topk(monkeypatch):
     layer.local_num_experts = 288
     layer._expert_map = None
     layer.layer_name = "model.layers.3.mlp.experts"
-    buffers = {}
+    buffers: dict[tuple[str, tuple[int, ...], torch.dtype], torch.Tensor] = {}
 
     def get_buffer(self, name, shape, dtype):
         key = (name, shape, dtype)
