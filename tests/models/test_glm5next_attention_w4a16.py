@@ -7,6 +7,12 @@ import pytest
 import torch
 from torch import nn
 
+from vllm.model_executor.layers.quantization.online.base import (
+    OnlineQuantizationConfig,
+)
+from vllm.model_executor.layers.quantization.utils.quant_utils import (
+    kFp8StaticTensorSym,
+)
 from vllm.models.glm5next.nvidia import attention as attention_module
 from vllm.models.glm5next.nvidia import kda as kda_module
 from vllm.models.glm5next.nvidia.quantization import (
@@ -31,11 +37,23 @@ class _FakeLinear(nn.Module):
 
 def test_glm5_attention_w4a16_fails_closed(monkeypatch):
     monkeypatch.delenv("LVLLM_GLM5_ATTN_W4A16", raising=False)
+    monkeypatch.delenv("LVLLM_GLM5_ATTN_W8A16", raising=False)
     assert get_glm5_next_attention_quant_config() is None
 
     monkeypatch.setenv("LVLLM_GLM5_ATTN_W4A16", "1")
     with pytest.raises(RuntimeError, match="single-token decode collapse"):
         get_glm5_next_attention_quant_config()
+
+
+def test_glm5_attention_w8a16_uses_online_fp8(monkeypatch):
+    monkeypatch.delenv("LVLLM_GLM5_ATTN_W4A16", raising=False)
+    monkeypatch.setenv("LVLLM_GLM5_ATTN_W8A16", "1")
+
+    quant_config = get_glm5_next_attention_quant_config()
+
+    assert isinstance(quant_config, OnlineQuantizationConfig)
+    assert quant_config.args.linear is not None
+    assert quant_config.args.linear.weight == kFp8StaticTensorSym
 
 
 def test_glm5_kda_w4a16_keeps_recurrent_stack_unquantized(monkeypatch):
@@ -134,10 +152,15 @@ def test_glm5_mla_keeps_attention_projections_unquantized(monkeypatch):
         lambda: 1,
     )
     monkeypatch.setattr(attention_module, "get_rope", lambda *args, **kwargs: object())
+
+    def fake_indexer(*args, **kwargs):
+        indexer_configs.append(args[4])
+        return nn.Identity()
+
     monkeypatch.setattr(
         attention_module,
         "Indexer",
-        lambda *args, **kwargs: indexer_configs.append(args[4]) or nn.Identity(),
+        fake_indexer,
     )
     monkeypatch.setattr(attention_module, "MLAModules", lambda **kwargs: kwargs)
 
@@ -197,10 +220,15 @@ def test_glm5_kpool_indexer_sizes_workspace_in_pool_units(monkeypatch):
     )
     monkeypatch.setattr(attention_module, "Glm5NextIndexerCache", FakeCache)
     monkeypatch.setattr(attention_module, "Glm5NextTailCache", FakeCache)
+
+    def fake_sparse_attn_indexer(*args, **kwargs):
+        captured.append(args)
+        return nn.Identity()
+
     monkeypatch.setattr(
         attention_module,
         "SparseAttnIndexerKpool",
-        lambda *args, **kwargs: captured.append(args) or nn.Identity(),
+        fake_sparse_attn_indexer,
     )
 
     max_model_len = 1_048_576
