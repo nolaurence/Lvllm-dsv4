@@ -279,6 +279,7 @@ if TYPE_CHECKING:
     VLLM_OBJECT_STORAGE_SHM_BUFFER_NAME: str = "VLLM_OBJECT_STORAGE_SHM_BUFFER"
     LVLLM_MOE_NUMA_ENABLED: bool = False
     LVLLM_GLM5_ATTN_W4A16: bool = False
+    LVLLM_GLM5_ATTN_W8A16: bool = False
     LVLLM_GLM5_SHARED_EXPERT_CPU: bool = False
     LVLLM_GLM5_DEFERRED_MOE_ALLREDUCE: bool = False
     LVLLM_MOE_PROFILE_MAX_TOKENS: int = 8192
@@ -2011,6 +2012,9 @@ environment_variables: dict[str, Callable[[], Any]] = {
     ),
     # Fail-closed compatibility flag for the disabled GLM-5 attention W4 path.
     "LVLLM_GLM5_ATTN_W4A16": lambda: bool(int(os.getenv("LVLLM_GLM5_ATTN_W4A16", "0"))),
+    # Online-quantize GLM-5 attention projections to FP8 weights (W8A16 via
+    # Marlin on Ampere; W8A8 where FP8 GEMM hardware exists).
+    "LVLLM_GLM5_ATTN_W8A16": lambda: bool(int(os.getenv("LVLLM_GLM5_ATTN_W8A16", "0"))),
     # Fold GLM-5's shared expert into the LK CPU MoE as one always-on expert.
     "LVLLM_GLM5_SHARED_EXPERT_CPU": lambda: bool(
         int(os.getenv("LVLLM_GLM5_SHARED_EXPERT_CPU", "0"))
