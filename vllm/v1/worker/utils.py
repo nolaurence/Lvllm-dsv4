@@ -24,7 +24,7 @@ from vllm.v1.attention.backend import (
     AttentionMetadataBuilder,
     MultipleOf,
 )
-from vllm.v1.core.kv_cache_utils import KVCacheBlockCopy
+from vllm.v1.core.kv_cache_utils import KVCacheBlockCopy, KVCacheBlockRef
 from vllm.v1.kv_cache_interface import (
     AttentionSpec,
     EncoderOnlyAttentionSpec,
@@ -116,6 +116,7 @@ class KVBlockZeroer:
         static_forward_context: dict[str, Any],
         num_blocks: int,
         runner_only_attn_layers: set[str] | None = None,
+        kv_cache_group_pool_ids: Sequence[int] | None = None,
     ) -> None:
         """Precompute the absolute-address table for the Triton zeroing kernel.
 
@@ -139,18 +140,27 @@ class KVBlockZeroer:
         self._meta: (
             tuple[torch.Tensor, torch.Tensor, torch.Tensor, int, int, int] | None
         ) = None
+        self._meta_by_pool: dict[
+            int, tuple[torch.Tensor, torch.Tensor, torch.Tensor, int, int, int]
+        ] = {}
 
         if runner_only_attn_layers is None:
             runner_only_attn_layers = set()
         # Overlaid layers (packed layouts) share a base address but may have
         # different page sizes; keep the widest span per address so newly
         # allocated blocks are fully zeroed for every overlaying group.
-        seen_ptrs: dict[int, int] = {}
+        seen_ptrs: dict[tuple[int, int], int] = {}
         seg_addrs: list[int] = []
         seg_block_strides: list[int] = []
         seg_page_sizes: list[int] = []
+        seg_pool_ids: list[int] = []
 
         for group in attn_groups_iter:
+            pool_id = (
+                kv_cache_group_pool_ids[group.kv_cache_group_id]
+                if kv_cache_group_pool_ids is not None
+                else 0
+            )
             spec = group.kv_cache_spec
             if not isinstance(spec, AttentionSpec):
                 continue
@@ -193,7 +203,8 @@ class KVBlockZeroer:
                     assert (dp + off_bytes) % 4 == 0
                     for virtual_index in range(ratio):
                         addr = dp + off_bytes + virtual_index * block_stride_bytes
-                        if (idx := seen_ptrs.get(addr)) is not None:
+                        ptr_key = (pool_id, addr)
+                        if (idx := seen_ptrs.get(ptr_key)) is not None:
                             assert (
                                 seg_block_strides[idx]
                                 == logical_block_stride_bytes // 4
@@ -202,53 +213,79 @@ class KVBlockZeroer:
                                 seg_page_sizes[idx], kernel_page_bytes // 4
                             )
                             continue
-                        seen_ptrs[addr] = len(seg_addrs)
+                        seen_ptrs[ptr_key] = len(seg_addrs)
                         seg_addrs.append(addr)
                         seg_block_strides.append(logical_block_stride_bytes // 4)
                         seg_page_sizes.append(kernel_page_bytes // 4)
+                        seg_pool_ids.append(pool_id)
 
         if not seg_addrs:
             self._meta = None
             return
 
-        max_page_size_el = max(seg_page_sizes)
-        blk_size = min(1 << (max_page_size_el - 1).bit_length(), 1024)
-        self._meta = (
-            torch.tensor(seg_addrs, dtype=torch.uint64, device=self.device),
-            torch.tensor(seg_block_strides, dtype=torch.int64, device=self.device),
-            torch.tensor(seg_page_sizes, dtype=torch.int64, device=self.device),
-            (max_page_size_el + blk_size - 1) // blk_size,
-            blk_size,
-            len(seg_addrs),
-        )
+        for pool_id in set(seg_pool_ids):
+            indices = [i for i, value in enumerate(seg_pool_ids) if value == pool_id]
+            pool_page_sizes = [seg_page_sizes[i] for i in indices]
+            max_page_size_el = max(pool_page_sizes)
+            blk_size = min(1 << (max_page_size_el - 1).bit_length(), 1024)
+            self._meta_by_pool[pool_id] = (
+                torch.tensor(
+                    [seg_addrs[i] for i in indices],
+                    dtype=torch.uint64,
+                    device=self.device,
+                ),
+                torch.tensor(
+                    [seg_block_strides[i] for i in indices],
+                    dtype=torch.int64,
+                    device=self.device,
+                ),
+                torch.tensor(pool_page_sizes, dtype=torch.int64, device=self.device),
+                (max_page_size_el + blk_size - 1) // blk_size,
+                blk_size,
+                len(indices),
+            )
+        self._meta = self._meta_by_pool.get(0)
 
-    def zero_block_ids(self, block_ids: list[int]) -> None:
+    def zero_block_ids(self, block_ids: Sequence[int | KVCacheBlockRef]) -> None:
         """Zero the KV cache memory for the given block IDs."""
-        if not block_ids or self._meta is None:
+        if not block_ids:
             return
-        (
-            seg_addrs,
-            seg_block_strides,
-            seg_page_sizes,
-            max_chunks,
-            blk_size,
-            n_segs,
-        ) = self._meta
-        n_blocks = len(block_ids)
-        idx = async_tensor_h2d(block_ids, device=self.device, dtype=torch.int64)
-        grid = (n_blocks, n_segs, max_chunks)
-        _zero_kv_blocks_kernel[grid](
-            seg_addrs,
-            seg_block_strides,
-            seg_page_sizes,
-            idx,
-            BLOCK_SIZE=blk_size,
-        )
+        ids_by_pool: defaultdict[int, list[int]] = defaultdict(list)
+        for block in block_ids:
+            if isinstance(block, int):
+                ids_by_pool[0].append(block)
+            else:
+                ids_by_pool[block.pool_id].append(block.block_id)
+        for pool_id, pool_block_ids in ids_by_pool.items():
+            meta = self._meta_by_pool.get(pool_id)
+            if meta is None:
+                continue
+            (
+                seg_addrs,
+                seg_block_strides,
+                seg_page_sizes,
+                max_chunks,
+                blk_size,
+                n_segs,
+            ) = meta
+            idx = async_tensor_h2d(
+                pool_block_ids, device=self.device, dtype=torch.int64
+            )
+            grid = (len(pool_block_ids), n_segs, max_chunks)
+            _zero_kv_blocks_kernel[grid](
+                seg_addrs,
+                seg_block_strides,
+                seg_page_sizes,
+                idx,
+                BLOCK_SIZE=blk_size,
+            )
 
     def warmup(self, num_kv_blocks: int) -> None:
         """JIT-compile the zeroing kernel before the first real request."""
         if num_kv_blocks > 0:
-            self.zero_block_ids([0])
+            self.zero_block_ids(
+                [KVCacheBlockRef(0, pool_id) for pool_id in self._meta_by_pool]
+            )
 
 
 @dataclass
@@ -605,12 +642,7 @@ def bind_kv_cache(
     assert len(runner_kv_caches) == 0
 
     # Convert kv_caches dict to a list of tensors in the order of layer_index.
-    index2name = defaultdict(list)
-    for layer_name in kv_caches:
-        index2name[extract_layer_index(layer_name, num_attn_module)].append(layer_name)
-
-    for layer_index in sorted(index2name.keys()):
-        layer_names = index2name[layer_index]
+    for layer_names in _ordered_kv_cache_layer_names(kv_caches, num_attn_module):
         if len(layer_names) > 1:
             # One typical case is encoder-decoder model, e.g., bart.
             # The cross attention and self attention in the same decoder layer
@@ -631,15 +663,71 @@ def bind_kv_cache(
         forward_context[layer_name].bind_kv_cache(kv_cache)
 
 
+def _ordered_kv_cache_layer_names(
+    kv_caches: Mapping[str, torch.Tensor], num_attn_module: int = 1
+) -> list[list[str]]:
+    index2name: defaultdict[int, list[str]] = defaultdict(list)
+    for layer_name in kv_caches:
+        index2name[extract_layer_index(layer_name, num_attn_module)].append(layer_name)
+    return [index2name[index] for index in sorted(index2name)]
+
+
+def get_runner_kv_cache_pool_ids(
+    kv_caches: Mapping[str, torch.Tensor],
+    kv_cache_config: KVCacheConfig,
+    num_attn_module: int = 1,
+) -> list[int]:
+    """Return logical pool IDs in the model runner's KV-cache list order."""
+    layer_to_pool = {
+        layer_name: group.pool_id
+        for group in kv_cache_config.kv_cache_groups
+        for layer_name in group.layer_names
+    }
+    return [
+        layer_to_pool.get(layer_name, 0)
+        for layer_names in _ordered_kv_cache_layer_names(kv_caches, num_attn_module)
+        for layer_name in layer_names
+    ]
+
+
 def copy_kv_cache_blocks_inplace(
     kv_caches: Iterable[torch.Tensor],
     num_blocks: int,
     kv_cache_block_copies: Sequence[KVCacheBlockCopy],
+    kv_cache_pool_ids: Sequence[int] | None = None,
 ) -> None:
     if not kv_cache_block_copies:
         return
 
-    indices_np = np.array(kv_cache_block_copies, dtype=np.int64)
+    caches = list(kv_caches)
+    if kv_cache_pool_ids is None:
+        kv_cache_pool_ids = [0] * len(caches)
+    assert len(caches) == len(kv_cache_pool_ids)
+    copies_by_pool: defaultdict[int, list[tuple[int, int]]] = defaultdict(list)
+    for copy in kv_cache_block_copies:
+        copies_by_pool[copy.pool_id].append((copy.src_block_id, copy.dst_block_id))
+    allow_storage_copy = len(set(kv_cache_pool_ids)) == 1
+
+    for pool_id, pool_copies in copies_by_pool.items():
+        _copy_kv_cache_blocks_for_pool(
+            [
+                cache
+                for cache, cache_pool_id in zip(caches, kv_cache_pool_ids)
+                if cache_pool_id == pool_id
+            ],
+            num_blocks,
+            pool_copies,
+            allow_storage_copy,
+        )
+
+
+def _copy_kv_cache_blocks_for_pool(
+    kv_caches: Iterable[torch.Tensor],
+    num_blocks: int,
+    block_copies: Sequence[tuple[int, int]],
+    allow_storage_copy: bool,
+) -> None:
+    indices_np = np.array(block_copies, dtype=np.int64)
     indices: torch.Tensor | None = None
     seen: set[tuple[torch.device, int]] = set()
     copied_storages: set[tuple[torch.device, int]] = set()
@@ -666,7 +754,10 @@ def copy_kv_cache_blocks_inplace(
         scheduler_block_stride = (
             cache.stride(0) * cache.element_size() * kernel_blocks_per_block
         )
-        if storage.nbytes() == num_blocks * scheduler_block_stride:
+        if (
+            allow_storage_copy
+            and storage.nbytes() == num_blocks * scheduler_block_stride
+        ):
             if storage_key in copied_storages:
                 continue
             copied_storages.add(storage_key)

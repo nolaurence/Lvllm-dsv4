@@ -155,6 +155,7 @@ from vllm.v1.attention.backends.utils import (
     get_dcp_local_seq_lens,
     reorder_batch_to_split_decodes_and_prefills,
 )
+from vllm.v1.core.kv_cache_utils import KVCacheBlockRef
 from vllm.v1.core.sched.output import NewRequestData
 from vllm.v1.cudagraph_dispatcher import CudagraphDispatcher
 from vllm.v1.kv_cache_interface import (
@@ -246,6 +247,7 @@ from .utils import (
     allocate_kv_cache,
     bind_kv_cache,
     copy_kv_cache_blocks_inplace,
+    get_runner_kv_cache_pool_ids,
     prepare_kernel_block_sizes,
     sanity_check_mm_encoder_outputs,
 )
@@ -613,6 +615,7 @@ class GPUModelRunner(
         # self.model: nn.Module  # Set after load_model
         # Initialize in initialize_kv_cache
         self.kv_caches: list[torch.Tensor] = []
+        self.kv_cache_pool_ids: list[int] = []
         # indexes: [kv_cache_group_id][attn_group]
         self.attn_groups: list[list[AttentionGroup]] = []
         # self.kv_cache_config: KVCacheConfig
@@ -1147,9 +1150,12 @@ class GPUModelRunner(
             runner_only_attn_layers=self.runner_only_attn_layers,
             static_forward_context=self.compilation_config.static_forward_context,
             num_blocks=self.kv_cache_config.num_blocks,
+            kv_cache_group_pool_ids=[
+                group.pool_id for group in self.kv_cache_config.kv_cache_groups
+            ],
         )
 
-    def _zero_block_ids(self, block_ids: list[int]) -> None:
+    def _zero_block_ids(self, block_ids: list[int | KVCacheBlockRef]) -> None:
         """Zero the KV cache memory for the given block IDs."""
         if hasattr(self, "_kv_block_zeroer"):
             self._kv_block_zeroer.zero_block_ids(block_ids)
@@ -1223,6 +1229,7 @@ class GPUModelRunner(
                 self.kv_caches,
                 self.kv_cache_config.num_blocks,
                 scheduler_output.kv_cache_block_copies,
+                self.kv_cache_pool_ids,
             )
 
         # Free the cached encoder outputs.
@@ -7551,6 +7558,9 @@ class GPUModelRunner(
             self.compilation_config.static_forward_context,
             self.kv_caches,
             num_attn_module,
+        )
+        self.kv_cache_pool_ids = get_runner_kv_cache_pool_ids(
+            kv_caches, kv_cache_config, num_attn_module
         )
         return kv_caches
 

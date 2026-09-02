@@ -166,14 +166,16 @@ class BlockPool:
         hash_block_size: int,
         enable_kv_cache_events: bool = False,
         metrics_collector: KVCacheMetricsCollector | None = None,
+        pool_id: int = 0,
     ):
         assert isinstance(num_gpu_blocks, int) and num_gpu_blocks > 0
         self.num_gpu_blocks = num_gpu_blocks
         self.enable_caching = enable_caching
         self.hash_block_size = hash_block_size
         # All kv-cache blocks.
+        self.pool_id = pool_id
         self.blocks: list[KVCacheBlock] = [
-            KVCacheBlock(idx) for idx in range(num_gpu_blocks)
+            KVCacheBlock(idx, pool_id=pool_id) for idx in range(num_gpu_blocks)
         ]
         # Free block queue that constructs and manipulates a doubly linked
         # list of free blocks (including eviction candidates when caching is
@@ -829,3 +831,55 @@ class BlockPool:
         events = self.kv_event_queue
         self.kv_event_queue = []
         return events
+
+
+class BlockPoolCollection:
+    """Dispatch block operations across independent logical pools."""
+
+    def __init__(self, pools: Sequence[BlockPool]) -> None:
+        assert pools
+        self.pools = tuple(pools)
+        self.num_gpu_blocks = pools[0].num_gpu_blocks
+        assert all(pool.num_gpu_blocks == self.num_gpu_blocks for pool in pools)
+
+    def _pool_for_block(self, block: KVCacheBlock) -> BlockPool:
+        return self.pools[block.pool_id]
+
+    def get_num_free_blocks(self) -> int:
+        return min(pool.get_num_free_blocks() for pool in self.pools)
+
+    def get_usage(self) -> float:
+        return max(pool.get_usage() for pool in self.pools)
+
+    def touch(self, blocks: Sequence[KVCacheBlock]) -> None:
+        by_pool: list[list[KVCacheBlock]] = [[] for _ in self.pools]
+        for block in blocks:
+            by_pool[block.pool_id].append(block)
+        for pool, pool_blocks in zip(self.pools, by_pool):
+            if pool_blocks:
+                pool.touch(pool_blocks)
+
+    def free_blocks(self, ordered_blocks: Iterable[KVCacheBlock]) -> None:
+        by_pool: list[list[KVCacheBlock]] = [[] for _ in self.pools]
+        for block in ordered_blocks:
+            by_pool[block.pool_id].append(block)
+        for pool, pool_blocks in zip(self.pools, by_pool):
+            if pool_blocks:
+                pool.free_blocks(pool_blocks)
+
+    def evict_blocks(self, block_ids: set[int]) -> None:
+        for pool in self.pools:
+            pool.evict_blocks(block_ids)
+
+    def reset_prefix_cache(self) -> bool:
+        if any(
+            pool.get_num_free_blocks() != pool.num_gpu_blocks - 1 for pool in self.pools
+        ):
+            logger.warning(
+                "Failed to reset prefix cache because some blocks are not freed yet"
+            )
+            return False
+        return all(pool.reset_prefix_cache() for pool in self.pools)
+
+    def take_events(self) -> list[KVCacheEvent]:
+        return [event for pool in self.pools for event in pool.take_events()]

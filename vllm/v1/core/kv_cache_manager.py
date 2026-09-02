@@ -14,7 +14,11 @@ from vllm.v1.core.kv_cache_coordinator import (
     get_kv_cache_coordinator,
 )
 from vllm.v1.core.kv_cache_metrics import KVCacheMetricsCollector
-from vllm.v1.core.kv_cache_utils import KVCacheBlock, KVCacheBlockCopy
+from vllm.v1.core.kv_cache_utils import (
+    KVCacheBlock,
+    KVCacheBlockCopy,
+    KVCacheBlockRef,
+)
 from vllm.v1.kv_cache_interface import (
     AttentionSpec,
     CrossAttentionSpec,
@@ -279,7 +283,8 @@ class KVCacheManager:
                 if num_blocks > 0:
                     group = self.kv_cache_config.kv_cache_groups[group_idx]
                     block_size = group.kv_cache_spec.block_size
-                    self.block_pool.emit_cached_block_events(
+                    pool_id = group.pool_id
+                    self.coordinator.block_pools[pool_id].emit_cached_block_events(
                         request,
                         num_blocks,
                         block_size,
@@ -802,25 +807,38 @@ class KVCacheManager:
             truncated.append(list(group_blocks[:num_blocks]))
         return self.create_kv_cache_blocks(tuple(truncated))
 
-    def take_new_block_ids(self) -> list[int]:
+    def take_new_block_ids(self) -> list[int | KVCacheBlockRef]:
         """Drain and return new attention block IDs for zeroing."""
-        ids: list[int] = []
+        ids: list[int | KVCacheBlockRef] = []
         for mgr in self.coordinator.single_type_managers:
-            ids.extend(mgr.take_new_block_ids())
+            new_ids = mgr.take_new_block_ids()
+            if self.kv_cache_config.num_pools == 1:
+                ids.extend(new_ids)
+            else:
+                ids.extend(
+                    KVCacheBlockRef(block_id, mgr.block_pool.pool_id)
+                    for block_id in new_ids
+                )
         return ids
 
     def get_zeroing_block_ids_in_range(
         self, request_id: str, start_token: int, end_token: int
-    ) -> list[int]:
+    ) -> list[int | KVCacheBlockRef]:
         """The request's block ids covering [start_token, end_token), from
         the groups whose new blocks are zeroed by the worker."""
-        ids: list[int] = []
+        ids: list[int | KVCacheBlockRef] = []
         for mgr in self.coordinator.single_type_managers:
             if mgr.records_new_block_ids:
                 start_idx = start_token // mgr.block_size
                 end_idx = cdiv(end_token, mgr.block_size)
                 blocks = mgr.req_to_blocks[request_id]
-                ids.extend(blk.block_id for blk in blocks[start_idx:end_idx])
+                if self.kv_cache_config.num_pools == 1:
+                    ids.extend(blk.block_id for blk in blocks[start_idx:end_idx])
+                else:
+                    ids.extend(
+                        KVCacheBlockRef(blk.block_id, blk.pool_id)
+                        for blk in blocks[start_idx:end_idx]
+                    )
         return ids
 
     def record_blocks_for_zeroing(self, request_id: str, start_token: int) -> None:
@@ -848,6 +866,7 @@ class KVCacheManager:
             KVCacheBlockCopy(
                 src_block_id=source_block.block_id,
                 dst_block_id=cow_block.block_id,
+                pool_id=source_block.pool_id,
             )
             for source_block, cow_block in pending_copies
         ]

@@ -182,6 +182,9 @@ class KVCacheBlock:
     # Whether the block is a null block that should never be cached.
     is_null: bool = False
 
+    # Logical pool that owns this block ID.
+    pool_id: int = 0
+
     @property
     def block_hash(self) -> BlockHashWithGroupId | None:
         return self._block_hash
@@ -224,6 +227,12 @@ class KVCacheBlock:
 class KVCacheBlockCopy(NamedTuple):
     src_block_id: int
     dst_block_id: int
+    pool_id: int = 0
+
+
+class KVCacheBlockRef(NamedTuple):
+    block_id: int
+    pool_id: int = 0
 
 
 class FreeKVCacheBlockQueue:
@@ -979,20 +988,17 @@ def get_max_concurrency_for_kv_cache_config(
     Get the maximum concurrency for the given KV cache configuration.
 
     A request at max_model_len consumes whole blocks from each group's block
-    table — cdiv(per-request bytes, page bytes) of the group's spec — and all
-    groups draw those block ids from one shared pool, so the per-request
-    total is the sum over groups. The memory/page ratio is identical whether
-    a group carries an aggregated UniformTypeKVCacheSpecs (worker config) or
-    a representative per-layer spec (scheduler config), so both capacity
-    call sites agree.
+    table. Groups in one logical pool compete for block IDs, while independent
+    pools may reuse the same IDs in disjoint tensor placements. Capacity is
+    limited by the pool with the largest per-request requirement.
     """
-    num_blocks_per_request = sum(
-        cdiv(
+    blocks_per_pool: defaultdict[int, int] = defaultdict(int)
+    for group in kv_cache_config.kv_cache_groups:
+        blocks_per_pool[group.pool_id] += cdiv(
             group.kv_cache_spec.max_memory_usage_bytes(vllm_config),
             group.kv_cache_spec.page_size_bytes,
         )
-        for group in kv_cache_config.kv_cache_groups
-    )
+    num_blocks_per_request = max(blocks_per_pool.values())
     max_concurrency = kv_cache_config.num_blocks / num_blocks_per_request
     return max_concurrency
 
@@ -1104,30 +1110,37 @@ def _get_kv_cache_groups_glm5_next(
         for name, spec in kv_cache_spec.items()
         if isinstance(spec, KpoolTailSpec)
     }
-    attn_specs = {
+    mla_specs: dict[str, KVCacheSpec] = {
         name: spec
         for name, spec in kv_cache_spec.items()
-        if not isinstance(spec, (MambaSpec, KpoolTailSpec))
+        if type(spec) is MLAAttentionSpec
     }
-    if not mamba_specs or not all(
-        type(spec) is MLAAttentionSpec for spec in attn_specs.values()
-    ):
+    other_specs = {
+        name: spec
+        for name, spec in kv_cache_spec.items()
+        if name not in mamba_specs and name not in tail_specs and name not in mla_specs
+    }
+    if not mamba_specs or not mla_specs:
         return None
 
-    mla_specs = cast(dict[str, MLAAttentionSpec], attn_specs)
+    typed_mla_specs = cast(dict[str, MLAAttentionSpec], mla_specs)
     idx_pages = {
-        spec.page_size_bytes for spec in mla_specs.values() if spec.tokens_per_state > 1
+        spec.page_size_bytes
+        for spec in typed_mla_specs.values()
+        if spec.tokens_per_state > 1
     }
     if not idx_pages:
         return None
 
-    assert all(spec.page_size_padded is None for spec in mla_specs.values())
+    assert all(spec.page_size_padded is None for spec in typed_mla_specs.values())
     assert len(idx_pages) == 1
-    mla_names = [name for name, spec in mla_specs.items() if spec.tokens_per_state == 1]
-    mla_pages = {mla_specs[name].page_size_bytes for name in mla_names}
+    mla_names = [
+        name for name, spec in typed_mla_specs.items() if spec.tokens_per_state == 1
+    ]
+    mla_pages = {typed_mla_specs[name].page_size_bytes for name in mla_names}
     assert len(mla_pages) == 1
     mla_page = mla_pages.pop()
-    uniform_spec = UniformTypeKVCacheSpecs.from_specs(attn_specs)
+    uniform_spec = UniformTypeKVCacheSpecs.from_specs(mla_specs)
     assert uniform_spec is not None
 
     tail_group: KVCacheGroupSpec | None = None
@@ -1164,11 +1177,18 @@ def _get_kv_cache_groups_glm5_next(
     for index, name in enumerate(mamba_specs):
         mamba_grouped_names[index % num_groups].append(name)
 
-    return (
-        [KVCacheGroupSpec(list(attn_specs), uniform_spec)]
+    glm5_groups = (
+        [KVCacheGroupSpec(list(mla_specs), uniform_spec)]
         + ([tail_group] if tail_group is not None else [])
         + create_kv_cache_group_specs(padded_specs, mamba_grouped_names)
     )
+    if not other_specs:
+        return glm5_groups
+    draft_groups = [
+        replace(group, pool_id=1)
+        for group in get_kv_cache_groups(vllm_config, other_specs)
+    ]
+    return glm5_groups + draft_groups
 
 
 def _glm5_next_tensor_layout(
@@ -1183,6 +1203,7 @@ def _glm5_next_tensor_layout(
         int,
         list[str],
         int,
+        list[KVCacheGroupSpec],
     ]
     | None
 ):
@@ -1205,9 +1226,6 @@ def _glm5_next_tensor_layout(
             tail_group = group
     if attn_group is None or not mamba_groups:
         return None
-    if len(uniform_groups) + len(mamba_groups) != len(kv_cache_groups):
-        return None
-
     attn_uniform = cast(UniformTypeKVCacheSpecs, attn_group.kv_cache_spec)
     mla_inner = cast(dict[str, MLAAttentionSpec], attn_uniform.kv_cache_specs)
     if not all(
@@ -1247,6 +1265,13 @@ def _glm5_next_tensor_layout(
         if tail_page > idx_page:
             return None
 
+    glm5_group_ids = {id(attn_group), *(id(group) for group in mamba_groups)}
+    if tail_group is not None:
+        glm5_group_ids.add(id(tail_group))
+    other_groups = [
+        group for group in kv_cache_groups if id(group) not in glm5_group_ids
+    ]
+
     return (
         attn_group,
         mamba_groups,
@@ -1256,6 +1281,7 @@ def _glm5_next_tensor_layout(
         idx_page,
         tail_names,
         tail_page,
+        other_groups,
     )
 
 
@@ -1487,8 +1513,19 @@ def _get_kv_cache_bytes_per_block(
 ) -> int:
     """Return the largest cache group's bytes per block."""
     if (glm5_layout := _glm5_next_tensor_layout(kv_cache_groups)) is not None:
-        _, _, mla_names, idx_names, mla_page, idx_page, _, _ = glm5_layout
-        return len(mla_names) * mla_page + len(idx_names) * idx_page
+        _, _, mla_names, idx_names, mla_page, idx_page, _, _, other_groups = glm5_layout
+        glm5_bytes = len(mla_names) * mla_page + len(idx_names) * idx_page
+        other_bytes = max(
+            (
+                sum(
+                    _get_per_layer_spec(group, layer_name).page_size_bytes
+                    for layer_name in group.layer_names
+                )
+                for group in other_groups
+            ),
+            default=0,
+        )
+        return glm5_bytes + other_bytes
 
     bytes_per_block = max(
         sum(
@@ -1573,8 +1610,9 @@ def get_kv_cache_config_from_groups(
             idx_page,
             tail_names,
             _,
+            other_groups,
         ) = glm5_layout
-        bytes_per_block = len(mla_names) * mla_page + len(idx_names) * idx_page
+        bytes_per_block = _get_kv_cache_bytes_per_block(kv_cache_groups)
         num_blocks = may_override_num_blocks(
             vllm_config, available_memory // bytes_per_block
         )
@@ -1616,6 +1654,33 @@ def get_kv_cache_config_from_groups(
                     UniformTypeKVCacheSpecs, tail_group.kv_cache_spec
                 ).kv_cache_specs
                 add_tensor(tail_name, tail_specs[tail_name], offset)
+
+        if other_groups:
+            other_base = (
+                len(mla_names) * mla_page + len(idx_names) * idx_page
+            ) * num_blocks
+            for group in other_groups:
+                group_offset = other_base
+                layers = sorted(
+                    (
+                        (layer_name, _get_per_layer_spec(group, layer_name))
+                        for layer_name in group.layer_names
+                    ),
+                    key=lambda item: item[1].page_size_bytes,
+                    reverse=True,
+                )
+                for layer_name, spec in layers:
+                    page_size = spec.page_size_bytes
+                    kv_cache_tensors.append(
+                        KVCacheTensor(
+                            size=size,
+                            layers=[layer_name],
+                            layer_stride=page_size * num_blocks,
+                            block_stride=page_size,
+                            offset=group_offset,
+                        )
+                    )
+                    group_offset += page_size * num_blocks
 
         return KVCacheConfig(
             num_blocks=num_blocks,
@@ -2170,8 +2235,9 @@ def _max_memory_usage_bytes_from_groups(
     model has 8 full attention layers and 9 sliding window layers, they will
     be padded to 9 full + 9 sliding window for uniform group sizes.
 
-    Each group independently claims blocks from the shared pool, so a request consumes
-    the sum of the per-group block counts, i.e. ``bytes_per_block * total_blocks``.
+    Groups in one logical pool compete for blocks. Independent pools use
+    disjoint tensor placements and may reuse the same block IDs, so the
+    largest per-pool requirement determines physical memory usage.
     """
     if not kv_cache_groups:
         return 0
@@ -2186,33 +2252,51 @@ def _max_memory_usage_bytes_from_groups(
             idx_page,
             tail_names,
             _,
+            other_groups,
         ) = glm5_layout
         uniform_spec = cast(UniformTypeKVCacheSpecs, attn_group.kv_cache_spec)
-        total_blocks = uniform_spec.max_memory_usage_pages(vllm_config)
-        total_blocks += sum(
-            cdiv(
+        blocks_per_pool: defaultdict[int, int] = defaultdict(int)
+        blocks_per_pool[attn_group.pool_id] += uniform_spec.max_memory_usage_pages(
+            vllm_config
+        )
+        for group in mamba_groups:
+            blocks_per_pool[group.pool_id] += cdiv(
                 group.kv_cache_spec.max_memory_usage_bytes(vllm_config),
                 group.kv_cache_spec.page_size_bytes,
             )
-            for group in mamba_groups
-        )
         if tail_names:
-            total_blocks += 1
-        return total_blocks * (len(mla_names) * mla_page + len(idx_names) * idx_page)
+            tail_group = next(
+                group for group in kv_cache_groups if tail_names[0] in group.layer_names
+            )
+            blocks_per_pool[tail_group.pool_id] += 1
+        for group in other_groups:
+            blocks_per_pool[group.pool_id] += (
+                group.kv_cache_spec.max_memory_usage_pages(vllm_config)
+                if isinstance(group.kv_cache_spec, UniformTypeKVCacheSpecs)
+                else cdiv(
+                    group.kv_cache_spec.max_memory_usage_bytes(vllm_config),
+                    group.kv_cache_spec.page_size_bytes,
+                )
+            )
+        return max(blocks_per_pool.values()) * _get_kv_cache_bytes_per_block(
+            kv_cache_groups
+        )
 
     bytes_per_block = _pool_bytes_per_block(kv_cache_groups)
-    total_blocks = 0
+    generic_blocks_per_pool: defaultdict[int, int] = defaultdict(int)
     for group in kv_cache_groups:
         spec = group.kv_cache_spec
         if isinstance(spec, UniformTypeKVCacheSpecs):
-            total_blocks += spec.max_memory_usage_pages(vllm_config)
+            generic_blocks_per_pool[group.pool_id] += spec.max_memory_usage_pages(
+                vllm_config
+            )
         else:
-            total_blocks += cdiv(
+            generic_blocks_per_pool[group.pool_id] += cdiv(
                 spec.max_memory_usage_bytes(vllm_config),
                 spec.page_size_bytes,
             )
 
-    return bytes_per_block * total_blocks
+    return bytes_per_block * max(generic_blocks_per_pool.values())
 
 
 def _estimate_max_model_len_from_groups(
@@ -2351,6 +2435,8 @@ def _project_kv_cache_groups_to_worker(
                 worker_layer_names,
                 group_spec,
                 is_eagle_group=group.is_eagle_group and bool(worker_layer_names),
+                enable_kv_transfer=group.enable_kv_transfer,
+                pool_id=group.pool_id,
             )
         )
     return projected_groups

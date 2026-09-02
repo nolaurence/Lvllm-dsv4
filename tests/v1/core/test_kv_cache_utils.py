@@ -3,6 +3,7 @@
 import copy
 import hashlib
 import importlib
+from collections import defaultdict
 from collections.abc import Callable
 from dataclasses import replace
 from types import SimpleNamespace
@@ -22,7 +23,9 @@ from vllm.multimodal.inputs import (
 )
 from vllm.sampling_params import SamplingParams
 from vllm.utils.hashing import sha256, sha256_cbor, xxhash, xxhash_cbor
+from vllm.utils.math_utils import cdiv
 from vllm.utils.mem_constants import GiB_bytes
+from vllm.v1.core.block_pool import BlockPoolCollection
 from vllm.v1.core.kv_cache_manager import KVCacheManager
 from vllm.v1.core.kv_cache_utils import (
     BlockHash,
@@ -2946,6 +2949,105 @@ def test_mla_with_incompatible_swa_uses_one_full_allocation_group(caplog_vllm):
     assert promoted_draft.sliding_window == draft.sliding_window
     assert specs["draft.0"] is draft
     assert "attention compute is unchanged" in caplog_vllm.text
+
+
+def test_glm5_with_dflash_uses_independent_draft_pool_and_storage_lane():
+    specs = _glm5_like_kv_cache_spec_with_tail()
+    for layer_idx in range(5):
+        specs[f"draft_model.model.layers.{layer_idx}.self_attn.attn"] = (
+            new_sliding_window_spec(
+                block_size=16,
+                num_kv_heads=8,
+                head_size=128,
+                sliding_window=2048,
+            )
+        )
+
+    vllm_config = VllmConfig(model_config=ModelConfig(max_model_len=8192))
+    vllm_config.cache_config.kv_cache_layout = "LBHNC"
+    groups = get_kv_cache_groups(vllm_config, specs)
+    layout = kv_cache_utils._glm5_next_tensor_layout(groups)
+
+    assert layout is not None
+    other_groups = layout[-1]
+    assert len(other_groups) == 1
+    assert other_groups[0].pool_id == 1
+    assert set(other_groups[0].layer_names) == {
+        f"draft_model.model.layers.{layer_idx}.self_attn.attn" for layer_idx in range(5)
+    }
+
+    bytes_per_block = kv_cache_utils._pool_bytes_per_block(groups)
+    config = kv_cache_utils.get_kv_cache_config_from_groups(
+        vllm_config, groups, bytes_per_block * 100
+    )
+    tensors = _tensor_by_layer(config)
+
+    assert config.num_pools == 2
+    assert set(tensors) == set(specs)
+    target_tensors = [
+        tensors[name]
+        for name in specs
+        if name.endswith((".attn", ".indexer")) and not name.startswith("draft_model.")
+    ]
+    target_end = max(tensor.offset + tensor.layer_stride for tensor in target_tensors)
+    for layer_idx in range(5):
+        draft_name = f"draft_model.model.layers.{layer_idx}.self_attn.attn"
+        draft_tensor = tensors[draft_name]
+        assert draft_tensor.size == bytes_per_block * 100
+        assert draft_tensor.offset >= target_end
+        assert draft_tensor.block_stride == specs[draft_name].page_size_bytes
+
+    blocks_per_pool = defaultdict(int)
+    for group in config.kv_cache_groups:
+        blocks_per_pool[group.pool_id] += cdiv(
+            group.kv_cache_spec.max_memory_usage_bytes(vllm_config),
+            group.kv_cache_spec.page_size_bytes,
+        )
+    assert get_max_concurrency_for_kv_cache_config(
+        vllm_config, config
+    ) == pytest.approx(config.num_blocks / max(blocks_per_pool.values()))
+
+
+def test_kv_cache_coordinator_reuses_block_ids_across_logical_pools():
+    target_spec = new_kv_cache_spec(block_size=16)
+    draft_spec = new_sliding_window_spec(block_size=16, sliding_window=32)
+    config = KVCacheConfig(
+        num_blocks=4,
+        kv_cache_tensors=[],
+        kv_cache_groups=[
+            KVCacheGroupSpec(["target"], target_spec),
+            KVCacheGroupSpec(["draft"], draft_spec, pool_id=1),
+        ],
+    )
+    manager = KVCacheManager(
+        config,
+        max_model_len=64,
+        scheduler_block_size=16,
+        hash_block_size=16,
+        enable_caching=False,
+    )
+
+    required = manager.coordinator.get_num_blocks_to_allocate(
+        request_id="request",
+        num_tokens=16,
+        new_computed_blocks=([], []),
+        num_encoder_tokens=0,
+        total_computed_tokens=0,
+        num_local_computed_tokens=0,
+        num_tokens_main_model=16,
+    )
+    assert required == 1
+
+    blocks = manager.coordinator.allocate_new_blocks("request", 16, 16)
+    assert [group[0].block_id for group in blocks] == [1, 1]
+    assert [group[0].pool_id for group in blocks] == [0, 1]
+    assert isinstance(manager.block_pool, BlockPoolCollection)
+
+    manager.coordinator.free("request")
+    assert [pool.get_num_free_blocks() for pool in manager.coordinator.block_pools] == [
+        3,
+        3,
+    ]
 
 
 def test_get_kv_cache_spec_kind_prefers_specific_attention_subclasses():

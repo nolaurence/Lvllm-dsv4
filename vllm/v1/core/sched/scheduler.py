@@ -37,7 +37,7 @@ from vllm.v1.core.encoder_cache_manager import (
 )
 from vllm.v1.core.kv_cache_manager import KVCacheBlocks, KVCacheManager
 from vllm.v1.core.kv_cache_metrics import KVCacheMetricsCollector
-from vllm.v1.core.kv_cache_utils import KVCacheBlock
+from vllm.v1.core.kv_cache_utils import KVCacheBlock, KVCacheBlockRef
 from vllm.v1.core.sched.interface import PauseState, SchedulerInterface
 from vllm.v1.core.sched.output import (
     CachedRequestData,
@@ -321,7 +321,7 @@ class Scheduler(SchedulerInterface):
         self.needs_kv_cache_zeroing = kv_cache_config.needs_kv_cache_zeroing
         # Blocks that async KV loads will overwrite this step, skipped from
         # zeroing since the zeroing could race the out-of-band write.
-        self._skip_zero_block_ids: set[int] = set()
+        self._skip_zero_block_ids: set[int | KVCacheBlockRef] = set()
         self.need_mamba_block_aligned_split = (
             self.has_mamba_layers and self.cache_config.mamba_cache_mode == "align"
         )
@@ -1353,7 +1353,9 @@ class Scheduler(SchedulerInterface):
     ) -> KVConnectorMetadata:
         return connector.build_connector_meta(scheduler_output)
 
-    def _get_new_block_ids_to_zero(self) -> list[int] | None:
+    def _get_new_block_ids_to_zero(
+        self,
+    ) -> list[int | KVCacheBlockRef] | None:
         # Drain new attention block ids every step so the manager-side list
         # does not grow unbounded; only kv-cache zeroing consumes them.
         new_block_ids_to_zero = self.kv_cache_manager.take_new_block_ids()

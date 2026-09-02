@@ -1189,6 +1189,9 @@ class KVCacheGroupSpec:
     is_eagle_group: bool = False
     # Whether this group is part of the externally transferable KV state.
     enable_kv_transfer: bool = True
+    # Logical ownership pool for block IDs. Groups in different pools may own
+    # the same block ID when their tensor placements do not overlap.
+    pool_id: int = 0
 
 
 @dataclass
@@ -1213,6 +1216,11 @@ class KVCacheConfig:
     """Resolved retention policy for local prefix-cache checkpoints."""
     kv_cache_layout: str | None = None
     """The KV cache layout resolved by the engine core, adopted by all workers."""
+
+    @cached_property
+    def num_pools(self) -> int:
+        """Number of independent logical block-ownership pools."""
+        return max((group.pool_id for group in self.kv_cache_groups), default=0) + 1
 
     @cached_property
     def transfer_group_ids(self) -> tuple[int, ...]:

@@ -157,6 +157,7 @@ from vllm.v1.worker.lora_model_runner_mixin import LoRAModelRunnerMixin
 from vllm.v1.worker.utils import (
     KVBlockZeroer,
     copy_kv_cache_blocks_inplace,
+    get_runner_kv_cache_pool_ids,
     get_uniform_decode_token_count,
 )
 from vllm.v1.worker.workspace import use_workspace_lane
@@ -662,6 +663,15 @@ class GPUModelRunner(LoRAModelRunnerMixin):
             self.vllm_config,
             kv_cache_allocation_context=kv_cache_allocation_context,
         )
+        num_attn_module = (
+            2
+            if self.model_config.hf_config.model_type
+            in ("longcat_flash", "longcat_flash_ngram")
+            else 1
+        )
+        self.kv_cache_pool_ids = get_runner_kv_cache_pool_ids(
+            kv_caches_dict, self.kv_cache_config, num_attn_module
+        )
         if is_profiling:
             self.kv_connector = NO_OP_KV_CONNECTOR
         else:
@@ -675,6 +685,9 @@ class GPUModelRunner(LoRAModelRunnerMixin):
             kernel_block_sizes=self.kernel_block_sizes,
             static_forward_context=self.compilation_config.static_forward_context,
             num_blocks=self.kv_cache_config.num_blocks,
+            kv_cache_group_pool_ids=[
+                group.pool_id for group in self.kv_cache_config.kv_cache_groups
+            ],
         )
 
     @torch.inference_mode()
@@ -1102,6 +1115,7 @@ class GPUModelRunner(LoRAModelRunnerMixin):
                 self.kv_caches,
                 self.kv_cache_config.num_blocks,
                 scheduler_output.kv_cache_block_copies,
+                self.kv_cache_pool_ids,
             )
 
     def gather_batch_req_state(
