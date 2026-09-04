@@ -21,10 +21,7 @@ import torch
 from torch import Tensor
 
 from vllm.logger import init_logger
-from vllm.model_executor.layers.fused_moe.unquantized_fused_moe_method import (
-    UnquantizedFusedMoEMethod,
-)
-from vllm.utils import is_pin_memory_available
+from vllm.utils.platform_utils import is_pin_memory_available
 
 logger = init_logger(__name__)
 
@@ -176,7 +173,7 @@ class LKMoE:
         )
 
     def _init_method(self):
-        self._method = UnquantizedFusedMoEMethod()
+        self._method = None
 
     def _init_cuda_graph_buffers(self):
         if not hasattr(LKMoE, "_cuda_graphs"):

@@ -47,7 +47,7 @@ class LogprobsProcessor:
     ) -> "LogprobsProcessor":
         sampling_params = request.sampling_params
         assert sampling_params is not None
-        num_logprobs = sampling_params.logprobs
+        num_logprobs = sampling_params.num_logprobs
         num_prompt_logprobs = sampling_params.prompt_logprobs
         return cls(
             tokenizer=tokenizer,
@@ -134,7 +134,7 @@ class LogprobsProcessor:
         assert self.num_prompt_logprobs is not None
         assert self.prompt_logprobs is not None
 
-        token_ids, logprobs, ranks, _ = prompt_logprobs_tensors
+        token_ids, logprobs, ranks, *_ = prompt_logprobs_tensors
 
         # Recover shapes.
         num_prompt_tokens, num_logprobs = logprobs.shape

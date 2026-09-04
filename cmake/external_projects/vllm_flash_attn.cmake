@@ -29,33 +29,21 @@ if (DEFINED ENV{VLLM_FLASH_ATTN_SRC_DIR})
   set(VLLM_FLASH_ATTN_SRC_DIR $ENV{VLLM_FLASH_ATTN_SRC_DIR})
 endif()
 
-set(VLLM_FLASH_ATTN_EXPECTED_TAG "f5bc33cfc02c744d24a2e9d50e6db656de40611c")
-
 if(VLLM_FLASH_ATTN_SRC_DIR)
   FetchContent_Declare(
-          vllm-flash-attn SOURCE_DIR 
+          vllm-flash-attn SOURCE_DIR
           ${VLLM_FLASH_ATTN_SRC_DIR}
           BINARY_DIR ${CMAKE_BINARY_DIR}/vllm-flash-attn
   )
 else()
-  # Check if existing source already has the expected commit; if so, skip download
-  vllm_use_existing_source_if_commit_matches(NAME vllm-flash-attn EXPECTED_TAG ${VLLM_FLASH_ATTN_EXPECTED_TAG})
-  if(vllm-flash-attn_SOURCE_DIR)
-    FetchContent_Declare(
-            vllm-flash-attn SOURCE_DIR
-            ${vllm-flash-attn_SOURCE_DIR}
-            BINARY_DIR ${CMAKE_BINARY_DIR}/vllm-flash-attn
-    )
-  else()
-    FetchContent_Declare(
-            vllm-flash-attn
-            GIT_REPOSITORY https://github.com/vllm-project/flash-attention.git
-            GIT_TAG ${VLLM_FLASH_ATTN_EXPECTED_TAG}
-            GIT_PROGRESS TRUE
-            # Don't share the vllm-flash-attn build between build types
-            BINARY_DIR ${CMAKE_BINARY_DIR}/vllm-flash-attn
-    )
-  endif()
+  FetchContent_Declare(
+          vllm-flash-attn
+          GIT_REPOSITORY https://github.com/vllm-project/flash-attention.git
+          GIT_TAG 06bdd47c0d0383daf6a2ff0c418faff9c6da16e5
+          GIT_PROGRESS TRUE
+          # Don't share the vllm-flash-attn build between build types
+          BINARY_DIR ${CMAKE_BINARY_DIR}/vllm-flash-attn
+  )
 endif()
 
 # Make sure vllm-flash-attn install rules are nested under vllm/
@@ -66,11 +54,7 @@ install(CODE "set(OLD_CMAKE_INSTALL_PREFIX \"\${CMAKE_INSTALL_PREFIX}\")" ALL_CO
 install(CODE "set(CMAKE_INSTALL_PREFIX \"\${CMAKE_INSTALL_PREFIX}/vllm/\")" ALL_COMPONENTS)
 
 # Fetch the vllm-flash-attn library
-string(TIMESTAMP _ts "%Y-%m-%d %H:%M:%S")
-message(STATUS "[${_ts}] >>> FetchContent: downloading vllm-flash-attn ...")
 FetchContent_MakeAvailable(vllm-flash-attn)
-string(TIMESTAMP _ts "%Y-%m-%d %H:%M:%S")
-message(STATUS "[${_ts}] <<< FetchContent: vllm-flash-attn download complete")
 message(STATUS "vllm-flash-attn is available at ${vllm-flash-attn_SOURCE_DIR}")
 
 # Restore the install prefix after FA's install rules

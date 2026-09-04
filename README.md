@@ -36,7 +36,7 @@ Lvllm使用最新的vLLM源码，重新设计实现了MOE模型混合推理模�
  
 ```bash
 2026-04-06: lvllm-v2.1.0 - 增强使用LK_POWER_SAVING=1节能效果，支持FP8+BF16+AWQ4bit的混合MOE层推理
-2026-03-22: lvllm-v2.0.0 - FP8 MoE模型使用INT4专家量化时支持逐层加载，减少峰值内存占用，LVLLM_ENABLE_MOE_LAYERWISEISE_LOAD=1
+2026-03-22: lvllm-v2.0.0 - FP8 MoE模型使用INT4专家量化时支持逐层加载，减少峰值内存占用，LVLLM_ENABLE_MOE_LAYERWISE_LOAD=1
 2026-03-19: lvllm-v1.9.10 - 修复已知问题，支持新的moe模型类型[没有gate_proj], 例如：NVIDIA-Nemotron-3-Super-120B-A12B-BF16
 2026-03-11: lvllm-v1.9.2 - FP8、AWQ4bit模型开启GPU Prefill加速不再占用额外内存, FP8模型取消TO_DTYPE运行时类型转换、KEEP暂不支持开启GPU Prefill
 2026-03-05: lvllm-v1.9.0 - 优化GPU预填充和常规预填充，确保输出质量
@@ -136,7 +136,7 @@ LVLLM_GPU_PREFETCH_WINDOW=1 \
 LVLLM_GPU_PREFILL_MIN_BATCH_SIZE=2048 \
 LVLLM_ENABLE_NUMA_INTERLEAVE=1 \
 LVLLM_MOE_QUANT_ON_GPU=1 \
-LVLLM_ENABLE_MOE_LAYERWISEISE_LOAD=1 \
+LVLLM_ENABLE_MOE_LAYERWISE_LOAD=1 \
 vllm serve \
     --model /home/guqiong/Models/Qwen3.6-35B-A3B \
     --host 0.0.0.0 \
@@ -269,7 +269,7 @@ LVLLM_GPU_PREFETCH_WINDOW=1 \
 LVLLM_GPU_PREFILL_MIN_BATCH_SIZE=2048 \
 LVLLM_ENABLE_NUMA_INTERLEAVE=1 \
 LVLLM_MOE_QUANT_ON_GPU=1 \
-LVLLM_ENABLE_MOE_LAYERWISEISE_LOAD=1 \
+LVLLM_ENABLE_MOE_LAYERWISE_LOAD=1 \
 vllm serve \
     --model /home/guqiong/Models/Qwen3.5-122B-A10B \
     --host 0.0.0.0 \
@@ -316,7 +316,7 @@ LVLLM_GPU_PREFETCH_WINDOW=1 \
 LVLLM_GPU_PREFILL_MIN_BATCH_SIZE=2048 \
 LVLLM_ENABLE_NUMA_INTERLEAVE=1 \
 LVLLM_MOE_QUANT_ON_GPU=1 \
-LVLLM_ENABLE_MOE_LAYERWISEISE_LOAD=1 \
+LVLLM_ENABLE_MOE_LAYERWISE_LOAD=1 \
 vllm serve \
     --model /home/guqiong/Models/Qwen3.5-397B-A17B-FP8 \
     --host 0.0.0.0 \
@@ -495,10 +495,16 @@ vllm serve \
 | 环境变量 | 类型 | 默认值 | 说明 | 备注 |
 |--------|------|--------|------|------|
 | `LVLLM_MOE_NUMA_ENABLED` | 核心参数 | `0` | 是否启用混合推理: `1`-启用，`0`-禁用 | 设置为`0`禁用混合推理，行为与vLLM相同 |
+| `LVLLM_GLM5_ATTN_W4A16` | 禁用参数 | `0` | GLM-5 attention W4A16兼容开关 | 设为`1`会fail-closed；KDA和sparse MLA W4均复现单token decode塌缩 |
+| `LVLLM_GLM5_SHARED_EXPERT_CPU` | GPU显存参数 | `0` | 将GLM-5 shared expert追加到LK CPU MoE中计算 | 仅支持单个shared expert、EP1且无GPU常驻MoE层 |
+| `LVLLM_GLM5_DEFERRED_MOE_ALLREDUCE` | 实验性能参数 | `0` | 将GLM-5 MoE的TP all-reduce延迟到下一层mHC入口 | 本地实验路径，非KTransformers GLM实现；要求PIECEWISE CUDA Graph、TP>1、EP/SP/DBO关闭 |
+| `LVLLM_LK_MOE_ALLOW_PIECEWISE_CUDAGRAPH` | 性能参数 | `0` | 在LK CPU eager段前后捕获PIECEWISE CUDA Graph | 必须使用固定输出buffer；不会启用GLM mHC all-reduce融合 |
 | `LK_THREAD_BINDING` | 性能参数 | `CPU_CORE` | 线程绑定策略: `CPU_CORE`-按CPU核心绑定，`NUMA_NODE`-按NUMA节点绑定 | 默认按CPU核心绑定, 遇到性能问题时可尝试按NUMA节点绑定 |
 | `LK_THREADS` | 性能参数 | 自动计算 | 线程数量: 物理核心数-4 | 多GPU多进程时，物理核心数-4除以进程数量 |
 | `OMP_NUM_THREADS` | 性能参数 | 系统逻辑核心数量 | OpenMP线程数: 设置为`LK_THREADS`相同 |   | 
-| `LVLLM_MOE_USE_WEIGHT` | 性能参数 | `INT4` | FP8模型运行时专家权重格式 `KEEP`: 与模型一致，`INT4`: int4  |
+| `LVLLM_MOE_USE_WEIGHT` | 精度/性能参数 | `INT4` | FP8模型CPU专家格式：`FP8`保留官方block-FP8精度，`INT4`转换为Q4_0；`KEEP`不支持当前LK逐层路径 |
+| `LVLLM_KT_FP8_CHUNK_SIZE` | FP8预填充参数 | `128` | KTransformers FP8 CPU MoE单次处理的token数，较长输入会自动分块 | 增大可提升prefill吞吐但增加CPU内存；慢速prefill同时增大`VLLM_EXECUTE_MODEL_TIMEOUT_SECONDS` |
+| `LVLLM_MOE_PROFILE_MAX_TOKENS` | 启动参数 | `8192` | LK CPU MoE启动profile的最大token数 | 仅限制启动profile，不限制实际请求；设为`0`恢复scheduler上限 |
 | `LVLLM_GPU_RESIDENT_MOE_LAYERS` | GPU预填充参数 | 无 | 常驻GPU的MOE专家层`0`: 第0层，`0-1`: 第0层到第1层，`0,9`: 第0层和第9层 | 留足KV Cache显存后，分配多层可增加性能，并减少对应的内存占用，包含0层才有加速效果 |
 | `LVLLM_GPU_PREFETCH_WINDOW` | GPU预填充参数 | 无 | 预取窗口大小`1`: 预取1层MOE专家 |  一般预取1到2层即可 |
 | `LVLLM_GPU_PREFILL_MIN_BATCH_SIZE` | GPU预填充参数 | 无 | 使用GPU预填充的最小输入长度`4096`：输入长度达到该值后，启动GPU预填充 | 设置值不宜过小，设置为0则关闭GPU预填充功能 |
@@ -704,7 +710,7 @@ LVLLM_MOE_USE_WEIGHT=INT4
 # 慢速加载模型可避免OOM，建议值：加载模型文件时，内存充裕使用`0`，内存紧张使用`1`
 LVLLM_ENABLE_NUMA_INTERLEAVE=1 
 # FP8 MoE模型逐层加载，减少峰值内存占用
-LVLLM_ENABLE_MOE_LAYERWISEISE_LOAD=1
+LVLLM_ENABLE_MOE_LAYERWISE_LOAD=1
 ```
 
 ### 模型加载专家量化
@@ -718,7 +724,3 @@ LVLLM_MOE_QUANT_ON_GPU=1
 # 允许通过加大max_num_batched_tokens参数来提高cpu prefill速度，例如--max-num-batched-tokens 4096，如果开启了gpu prefill则取LVLLM_GPU_PREFILL_MIN_BATCH_SIZE、max_num_batched_tokens两者最小值
 --max-num-batched-tokens 4096
 ```
-
-
-
-

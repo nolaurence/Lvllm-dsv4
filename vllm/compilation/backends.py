@@ -23,6 +23,10 @@ from torch._logging._internal import trace_structured
 from torch.fx._lazy_graph_module import _use_lazy_graph_module
 
 import vllm.envs as envs
+from vllm.compilation.codegen import (
+    compile_execution_fn,
+    generate_execution_code,
+)
 from vllm.config import CompilationConfig, CUDAGraphMode, VllmConfig
 from vllm.config.compilation import DynamicShapesType
 from vllm.config.utils import Range, hash_factors
@@ -46,6 +50,7 @@ from .partition_rules import (
     should_split,
 )
 from .passes.inductor_pass import InductorPass, pass_context
+from .passes.ir.inplace_functionalization import VllmIRInplaceFunctionalizationPass
 from .passes.pass_manager import PostGradPassManager
 
 logger = init_logger(__name__)
@@ -265,6 +270,7 @@ class CompilerManager:
         compile_range: Range,
         graph_index: int = 0,
         num_graphs: int = 1,
+        is_encoder: bool = False,
     ) -> Any:
         if graph_index == 0:
             # before compiling the first graph, record the start time
@@ -274,6 +280,7 @@ class CompilerManager:
         compilation_counter.num_backend_compilations += 1
 
         compiled_graph = None
+        handle = None
 
         # try to load from the cache
         compiled_graph = self.load(graph, example_inputs, graph_index, compile_range)
@@ -354,7 +361,7 @@ class CompilerManager:
                     )
                 except StopCompiling:
                     assert cache_key is not None
-                    return self.loaded_artifacts[cache_key]
+                    compiled_graph = self.loaded_artifacts[cache_key]
             if cache_key is not None and compiled_graph is not None:
                 self.loaded_artifacts[cache_key] = compiled_graph
 
@@ -488,6 +495,11 @@ def _decompose_size_nodes(graph: fx.GraphModule) -> None:
     size_nodes = list(graph.graph.find_nodes(op="call_method", target="size"))
 
     for node in size_nodes:
+        # Only x.size() (no dim) returns a torch.Size tuple that can't cross
+        # split boundaries. x.size(dim) already returns a scalar SymInt/int,
+        # which crosses fine, so leave it untouched.
+        if len(node.args) > 1 or "dim" in node.kwargs:
+            continue
         tensor_node = node.args[0]
         ev = tensor_node.meta.get("example_value")
         assert ev is not None, (
@@ -926,6 +938,24 @@ class VllmBackend:
         return standalone_compile_artifacts, sym_shape_indices_map, returns_tuple_map
 
     def configure_post_pass(self) -> None:
+        # TODO proper PassManager?
+        pre_grad_pass_key = "pre_grad_custom_pass"
+        assert self.pass_key != pre_grad_pass_key
+        assert pre_grad_pass_key not in self.inductor_config
+        self.inductor_config[pre_grad_pass_key] = VllmIRInplaceFunctionalizationPass(
+            self.vllm_config
+        )
+
+        # Make sure pre_grad_custom_pass is not pickled
+        # as part of AOTAutograd built-in cache key
+        # TODO(luka) is there a cleaner way to do this
+        import torch._inductor.config as inductor_config
+
+        ignore = inductor_config._cache_config_ignore_prefix + [pre_grad_pass_key]
+        assert "_cache_config_ignore_prefix" not in self.inductor_config
+        self.inductor_config["_cache_config_ignore_prefix"] = ignore
+
+        # Configure the (nominally post-grad) pass manager
         self.pass_manager.configure(self.vllm_config)
 
         # Post-grad custom passes are run using the post_grad_custom_post_pass
@@ -972,7 +1002,7 @@ class VllmBackend:
             },
             payload_fn=lambda: json.dumps(
                 {
-                    "model": self.vllm_config.model_config.model,
+                    "model": getattr(self.vllm_config.model_config, "model", "unknown"),
                     "prefix": self.prefix,
                     "mode": str(cc.mode),
                     "backend": cc.backend,
@@ -1126,16 +1156,19 @@ class VllmBackend:
         compilation_counter.num_graphs_seen += 1
         from .monitor import torch_compile_start_time
 
-        dynamo_time = time.perf_counter() - torch_compile_start_time
+        current_perf = time.perf_counter()
+        current_epoch = time.time()
+        dynamo_time = current_perf - torch_compile_start_time
         logger.info_once(
             "Dynamo bytecode transform time: %.2f s", dynamo_time, scope="local"
         )
         self.compilation_config.compilation_time += dynamo_time
 
         # Record Dynamo time in tracing if available
-        start_time = int(torch_compile_start_time * 1e9)
+        real_start_time = current_epoch - dynamo_time
+        start_time_ns = int(real_start_time * 1e9)
         attributes = {"dynamo.time_seconds": dynamo_time}
-        instrument_manual("Dynamo bytecode transform", start_time, None, attributes)
+        instrument_manual("Dynamo bytecode transform", start_time_ns, None, attributes)
 
         # we control the compilation process, each instance can only be
         # called once
@@ -1236,11 +1269,12 @@ class VllmBackend:
             # code adapted from
             # https://github.com/thuml/depyf/blob/dab831108a752d1facc00acdd6d4243891845c37/depyf/explain/patched_lazy_format_graph_code.py#L30
             # use `print_readable` because it can include submodules
-            src = (
-                "from __future__ import annotations\nimport torch\n"
-                + self.split_gm.print_readable(print_output=False)
-            )
-            src = src.replace("<lambda>", "GraphModule")
+            with dynamo_timed("vllm_print_readable"):
+                src = (
+                    "from __future__ import annotations\nimport torch\n"
+                    + self.split_gm.print_readable(print_output=False)
+                )
+                src = src.replace("<lambda>", "GraphModule")
             with open(graph_path, "w") as f:
                 f.write(src)
 
@@ -1253,6 +1287,18 @@ class VllmBackend:
             original_split_gm if envs.VLLM_USE_MEGA_AOT_ARTIFACT else self.graph
         )
 
+        execution_code, submod_names, consts = generate_execution_code(self.split_gm)
+        # Use getattr to get correct callables: __dict__ has PiecewiseBackend
+        # instances (from PiecewiseCompileInterpreter), _modules has originals.
+        # getattr checks __dict__ first, then falls back to _modules.
+        submod_callables = {
+            name: getattr(self.split_gm, name)
+            for name, _ in self.split_gm.named_children()
+        }
+        runtime_callable = compile_execution_fn(
+            execution_code, submod_callables, submod_names, consts
+        )
+
         if (
             self.compilation_config.cudagraph_mode == CUDAGraphMode.NONE
             or not self.compilation_config.cudagraph_copy_inputs
@@ -1261,9 +1307,12 @@ class VllmBackend:
                 graph_to_serialize,
                 example_inputs,
                 self.prefix,
-                self.split_gm,
+                runtime_callable,
                 is_encoder=self.is_encoder,
                 vllm_backend=self,
+                execution_code=execution_code,
+                submod_names=submod_names,
+                consts=consts,
             )
 
         # index of tensors that have symbolic shapes (batch size)
@@ -1284,7 +1333,7 @@ class VllmBackend:
         copy_and_call = make_copy_and_call(
             sym_tensor_indices,
             [example_inputs[x].clone() for x in sym_tensor_indices],
-            self.split_gm,
+            runtime_callable,
         )
 
         return VllmSerializableFunction(
@@ -1295,4 +1344,7 @@ class VllmBackend:
             is_encoder=self.is_encoder,
             vllm_backend=self,
             sym_tensor_indices=sym_tensor_indices,
+            execution_code=execution_code,
+            submod_names=submod_names,
+            consts=consts,
         )

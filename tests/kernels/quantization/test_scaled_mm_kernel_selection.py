@@ -15,6 +15,7 @@ import torch
 from vllm.model_executor.kernels.linear import (
     AiterInt8ScaledMMLinearKernel,
     CPUInt8ScaledMMLinearKernel,
+    CutlassFP8ScaledMMLinearKernel,
     Int8ScaledMMLinearKernel,
     Int8ScaledMMLinearLayerConfig,
     ScaledMMLinearKernel,
@@ -69,6 +70,23 @@ def test_aiter_kernel_implements_is_supported():
     assert reason is None or isinstance(reason, str), "reason should be str or None"
     # On CPU, it should return False with a reason about requiring ROCm
     # This validates the method works correctly even on non-ROCm platforms
+
+
+@patch(
+    "vllm.model_executor.kernels.linear.scaled_mm.cutlass.cutlass_fp8_supported",
+    return_value=False,
+)
+@patch("vllm.model_executor.kernels.linear.scaled_mm.cutlass.current_platform")
+def test_cutlass_fp8_kernel_rejects_unsupported_device(
+    platform_mock, cutlass_fp8_supported_mock
+):
+    platform_mock.is_cuda.return_value = True
+
+    supported, reason = CutlassFP8ScaledMMLinearKernel.is_supported()
+
+    assert not supported
+    assert reason == "requires FP8 CUTLASS support."
+    cutlass_fp8_supported_mock.assert_called_once_with()
 
 
 def test_cpu_kernel_accepts_all_configs():

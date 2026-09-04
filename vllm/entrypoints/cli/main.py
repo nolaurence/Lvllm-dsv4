@@ -18,14 +18,17 @@ def main():
     import vllm.entrypoints.cli.benchmark.main
     import vllm.entrypoints.cli.collect_env
     import vllm.entrypoints.cli.launch
-    import vllm.entrypoints.cli.openai
+    import vllm.entrypoints.cli.openai_entrypoint
     import vllm.entrypoints.cli.run_batch
     import vllm.entrypoints.cli.serve
-    from vllm.entrypoints.utils import VLLM_SUBCMD_PARSER_EPILOG, cli_env_setup
+    from vllm.entrypoints.serve.utils.api_utils import (
+        VLLM_SUBCMD_PARSER_EPILOG,
+        cli_env_setup,
+    )
     from vllm.utils.argparse_utils import FlexibleArgumentParser
 
     CMD_MODULES = [
-        vllm.entrypoints.cli.openai,
+        vllm.entrypoints.cli.openai_entrypoint,
         vllm.entrypoints.cli.serve,
         vllm.entrypoints.cli.launch,
         vllm.entrypoints.cli.benchmark.main,
@@ -51,6 +54,8 @@ def main():
         logger.info("Delegating entrypoint handling to vllm-omni")
         omni_main()
     else:
+        vllm.entrypoints.cli.benchmark.main.maybe_exec_rust_bench()
+
         # For 'vllm bench *': use CPU instead of UnspecifiedPlatform by default
         if len(sys.argv) > 1 and sys.argv[1] == "bench":
             logger.debug(
