@@ -111,7 +111,7 @@ pip install torchaudio triton torchvision pybind11 torch==2.13.0
 ### 4. 安装Lvllm
 
 ```bash 
-MAX_JOBS=32 NVCC_THREADS=1 CMAKE_BUILD_TYPE=Release CMAKE_ARGS="-DCMAKE_BUILD_TYPE=Release" pip install -e . --no-build-isolation -vvv
+MAX_JOBS=16 NVCC_THREADS=1 CMAKE_BUILD_TYPE=Release CMAKE_GENERATOR=Ninja CMAKE_ARGS="-DCMAKE_BUILD_TYPE=Release" pip install -e . --no-build-isolation -vvv
 ```
 
 **参数说明：**
