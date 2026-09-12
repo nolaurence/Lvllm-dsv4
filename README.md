@@ -15,6 +15,140 @@ Lvllm使用最新的vLLM源码，重新设计实现了MOE模型混合推理模�
 
 注1：x86带有AVX2以上指令集的CPU和Nvidia GPU
 
+## 配置参数
+
+| 环境变量 | 类型 | 默认值 | 说明 | 备注 |
+|--------|------|--------|------|------|
+| `LVLLM_MOE_NUMA_ENABLED` | 核心参数 | `0` | 是否启用混合推理: `1`-启用，`0`-禁用 | 设置为`0`禁用混合推理，行为与vLLM相同 |
+| `LVLLM_GLM5_ATTN_W4A16` | 禁用参数 | `0` | GLM-5 attention W4A16兼容开关 | 设为`1`会fail-closed；KDA和sparse MLA W4均复现单token decode塌缩 |
+| `LVLLM_GLM5_SHARED_EXPERT_CPU` | GPU显存参数 | `0` | 将GLM-5 shared expert追加到LK CPU MoE中计算 | 仅支持单个shared expert、EP1且无GPU常驻MoE层 |
+| `LVLLM_GLM5_DEFERRED_MOE_ALLREDUCE` | 实验性能参数 | `0` | 将GLM-5 MoE的TP all-reduce延迟到下一层mHC入口 | 本地实验路径，非KTransformers GLM实现；要求PIECEWISE CUDA Graph、TP>1、EP/SP/DBO关闭 |
+| `LVLLM_LK_MOE_ALLOW_PIECEWISE_CUDAGRAPH` | 性能参数 | `0` | 在LK CPU eager段前后捕获PIECEWISE CUDA Graph | 必须使用固定输出buffer；不会启用GLM mHC all-reduce融合 |
+| `LK_THREAD_BINDING` | 性能参数 | `CPU_CORE` | 线程绑定策略: `CPU_CORE`-按CPU核心绑定，`NUMA_NODE`-按NUMA节点绑定 | 默认按CPU核心绑定, 遇到性能问题时可尝试按NUMA节点绑定 |
+| `LK_THREADS` | 性能参数 | 自动计算 | 线程数量: 物理核心数-4 | 多GPU多进程时，物理核心数-4除以进程数量 |
+| `OMP_NUM_THREADS` | 性能参数 | 系统逻辑核心数量 | OpenMP线程数: 设置为`LK_THREADS`相同 |   | 
+| `LVLLM_MOE_USE_WEIGHT` | 精度/性能参数 | `INT4` | FP8模型CPU专家格式：`FP8`保留官方block-FP8精度，`INT4`转换为Q4_0；`KEEP`不支持当前LK逐层路径 |
+| `LVLLM_KT_FP8_CHUNK_SIZE` | FP8预填充参数 | `128` | KTransformers FP8 CPU MoE单次处理的token数，较长输入会自动分块 | 增大可提升prefill吞吐但增加CPU内存；慢速prefill同时增大`VLLM_EXECUTE_MODEL_TIMEOUT_SECONDS` |
+| `LVLLM_MOE_PROFILE_MAX_TOKENS` | 启动参数 | `8192` | LK CPU MoE启动profile的最大token数 | 仅限制启动profile，不限制实际请求；设为`0`恢复scheduler上限 |
+| `LVLLM_GPU_RESIDENT_MOE_LAYERS` | GPU预填充参数 | 无 | 常驻GPU的MOE专家层`0`: 第0层，`0-1`: 第0层到第1层，`0,9`: 第0层和第9层 | 留足KV Cache显存后，分配多层可增加性能，并减少对应的内存占用，包含0层才有加速效果 |
+| `LVLLM_GPU_PREFETCH_WINDOW` | GPU预填充参数 | 无 | 预取窗口大小`1`: 预取1层MOE专家 |  一般预取1到2层即可 |
+| `LVLLM_GPU_PREFILL_MIN_BATCH_SIZE` | GPU预填充参数 | 无 | 使用GPU预填充的最小输入长度`4096`：输入长度达到该值后，启动GPU预填充 | 设置值不宜过小，设置为0则关闭GPU预填充功能 |
+| `LK_POWER_SAVING` | cpu节能 | 0 | `1`：启用cpu节能模式，`0`：禁用cpu节能模式 | 建议值：`0` |
+| `LVLLM_ENABLE_NUMA_INTERLEAVE` | 性能参数 | 0 | `0`：快速加载模型，`1`：慢速加载模型可避免OOM | 建议值：加载模型文件时，内存充裕使用`0`，内存紧张使用`1` |
+| `LVLLM_MOE_QUANT_ON_GPU` | 性能参数 | 0 | `0`：不启用GPU专家量化，`1`：启用GPU专家量化 | 显存充足可启用（仅加载时有效，推理时不会额外占用显存），加快模型加载速度 |
+
+ 
+| 参数 | 示例值 | 说明 |
+|-----------|-------|-------------|
+| `model` | `/home/guqiong/Models/Models/MiniMax-M2.7` | 模型目录路径 |
+| `host` | `0.0.0.0` | 服务绑定IP地址 |
+| `port` | `8070` | 服务绑定端口号 |
+| `tensor-parallel-size` | `2` | 张量并行大小，小于等于GPU数量 |
+| `pipeline-parallel-size` | `2` (commented) | 流水线并行大小，小于等于GPU数量 |
+| `max-model-len` | `18000` | 最大上下文长度，小于等于模型最大长度 |
+| `gpu-memory-utilization` | `0.92` | 分配给vLLM的GPU显存分配百分比，小于等于1 |
+| `trust-remote-code` | `true` | 是否信任远程代码，建议值 |
+| `tokenizer-mode` | `auto` | 分词器模式，建议值 |
+| `served-model-name` | `Models/MiniMax-M2.7` | 服务模型名称 |
+| `compilation_config.cudagraph_mode` | `FULL_DECODE_ONLY` | 启用CUDA图模式，建议值 |
+| `enable_prefix_caching` | `true` | 启用前缀缓存，建议值 |
+| `enable-chunked-prefill` | `true` | 启用分块预填充，建议值 |
+| `max_num_batched_tokens` | `18000` | 最大批量填充令牌数，关闭GPU预填充时建议值：1024，开启GPU预填充时建议值：同max-model-len |
+| `dtype` | `bfloat16` | 模型中间计算数据类型，建议值bfloat16或float16 |
+| `max_num_seqs` | `4` | 最大并发请求序列，建议值1到4 |
+| `compilation_config.mode` | `VLLM_COMPILE` | 优化模型，建议值 |
+ 
+ 
+| 参数 | 说明 |
+|-----------|-------------|
+| `kv_cache_dtype: "fp8"` | KV Cache数据类型，40系、50系GPU可开启 (commented) |
+| `speculative-config` | 推测解码配置，建议值关闭 (commented) |
+| `mm-encoder-tp-mode: "data"` | encoder TP模式 (commented) |
+ 
+
+## 安装步骤
+
+### 1. 安装CUDA 13.2
+
+```bash
+# 卸载旧版本CUDA和NVIDIA驱动
+sudo /usr/local/cuda/bin/cuda-uninstaller   
+sudo nvidia-uninstall
+
+# 下载并安装CUDA 13.2
+wget https://developer.download.nvidia.com/compute/cuda/13.2.0/local_installers/cuda_13.2.0_595.45.04_linux.run
+sudo sh cuda_13.2.0_595.45.04_linux.run
+```
+
+### 2. 创建Python环境
+
+```bash
+conda create -n Lvllm python==3.12.11
+conda activate Lvllm
+pip install setuptools_scm
+
+# 升级libstdcxx-ng（避免glibcxx版本问题）
+conda install -c conda-forge libstdcxx-ng
+export LD_LIBRARY_PATH=$CONDA_PREFIX/lib:$LD_LIBRARY_PATH
+
+# 安装NUMA库
+sudo apt-get install libnuma-dev      # Ubuntu
+sudo dnf install numactl-devel        # Rocky Linux
+```
+
+### 3. 安装依赖
+
+```bash
+# 克隆仓库
+git clone https://github.com/guqiong96/Lvllm.git
+cd Lvllm
+
+# 安装PyTorch 2.11.0
+pip install torchaudio triton torchvision pybind11 torch==2.11.0
+
+```
+ 
+### 4. 安装Lvllm
+
+```bash 
+MAX_JOBS=32 NVCC_THREADS=1 CMAKE_BUILD_TYPE=Release CMAKE_ARGS="-DCMAKE_BUILD_TYPE=Release" pip install -e . --no-build-isolation -vvv
+```
+
+**参数说明：**
+- `MAX_JOBS=32 NVCC_THREADS=1`: 减少编译内存占用
+- `CMAKE_BUILD_TYPE=Release`: 性能优化选项
+- `CMAKE_ARGS="-DCMAKE_BUILD_TYPE=Release`: 性能优化选项
+ 
+ 
+ 
+## 更新
+
+如果已安装Lvllm，需要更新到最新版本，请执行以下命令：
+
+```bash 
+# 此命令适合普通用户，如果保留本地修改内容的用户应知道提前做处理
+git fetch && git reset --hard origin/main && git clean -fd 
+
+# 安装PyTorch 2.11.0
+pip uninstall torchaudio triton torchvision torch vllm
+pip install torchaudio triton torchvision pybind11 torch==2.11.0
+
+# Qwen3-VL GLM4.6V 需要安装 xformers
+  
+# 编译安装
+rm -rf .deps/*build* 
+rm -rf build 
+MAX_JOBS=32 NVCC_THREADS=1 CMAKE_BUILD_TYPE=Release CMAKE_ARGS="-DCMAKE_BUILD_TYPE=Release" pip install -e . --no-build-isolation -vvv
+
+rm -rf ~/.cache/vllm
+rm -rf ~/.cache/flashinfer
+rm -rf ~/.triton/cache
+
+# 编译打包
+TORCH_CUDA_ARCH_LIST="8.0;8.6" MAX_JOBS=32 NVCC_THREADS=1 CMAKE_BUILD_TYPE=Release CMAKE_ARGS="-DCMAKE_BUILD_TYPE=Release" pip wheel . --no-build-isolation -vvv -w dist/
+```
+
+
 ## 使用说明 [[English]](README_old.md)
 - [版本变更](#版本变更)
 - [支持的模型](#支持的模型)
@@ -487,140 +621,6 @@ vllm serve \
     --tool-call-parser glm47 \
     --reasoning-parser glm45 
 
-```
-
-
-## 配置参数
-
-| 环境变量 | 类型 | 默认值 | 说明 | 备注 |
-|--------|------|--------|------|------|
-| `LVLLM_MOE_NUMA_ENABLED` | 核心参数 | `0` | 是否启用混合推理: `1`-启用，`0`-禁用 | 设置为`0`禁用混合推理，行为与vLLM相同 |
-| `LVLLM_GLM5_ATTN_W4A16` | 禁用参数 | `0` | GLM-5 attention W4A16兼容开关 | 设为`1`会fail-closed；KDA和sparse MLA W4均复现单token decode塌缩 |
-| `LVLLM_GLM5_SHARED_EXPERT_CPU` | GPU显存参数 | `0` | 将GLM-5 shared expert追加到LK CPU MoE中计算 | 仅支持单个shared expert、EP1且无GPU常驻MoE层 |
-| `LVLLM_GLM5_DEFERRED_MOE_ALLREDUCE` | 实验性能参数 | `0` | 将GLM-5 MoE的TP all-reduce延迟到下一层mHC入口 | 本地实验路径，非KTransformers GLM实现；要求PIECEWISE CUDA Graph、TP>1、EP/SP/DBO关闭 |
-| `LVLLM_LK_MOE_ALLOW_PIECEWISE_CUDAGRAPH` | 性能参数 | `0` | 在LK CPU eager段前后捕获PIECEWISE CUDA Graph | 必须使用固定输出buffer；不会启用GLM mHC all-reduce融合 |
-| `LK_THREAD_BINDING` | 性能参数 | `CPU_CORE` | 线程绑定策略: `CPU_CORE`-按CPU核心绑定，`NUMA_NODE`-按NUMA节点绑定 | 默认按CPU核心绑定, 遇到性能问题时可尝试按NUMA节点绑定 |
-| `LK_THREADS` | 性能参数 | 自动计算 | 线程数量: 物理核心数-4 | 多GPU多进程时，物理核心数-4除以进程数量 |
-| `OMP_NUM_THREADS` | 性能参数 | 系统逻辑核心数量 | OpenMP线程数: 设置为`LK_THREADS`相同 |   | 
-| `LVLLM_MOE_USE_WEIGHT` | 精度/性能参数 | `INT4` | FP8模型CPU专家格式：`FP8`保留官方block-FP8精度，`INT4`转换为Q4_0；`KEEP`不支持当前LK逐层路径 |
-| `LVLLM_KT_FP8_CHUNK_SIZE` | FP8预填充参数 | `128` | KTransformers FP8 CPU MoE单次处理的token数，较长输入会自动分块 | 增大可提升prefill吞吐但增加CPU内存；慢速prefill同时增大`VLLM_EXECUTE_MODEL_TIMEOUT_SECONDS` |
-| `LVLLM_MOE_PROFILE_MAX_TOKENS` | 启动参数 | `8192` | LK CPU MoE启动profile的最大token数 | 仅限制启动profile，不限制实际请求；设为`0`恢复scheduler上限 |
-| `LVLLM_GPU_RESIDENT_MOE_LAYERS` | GPU预填充参数 | 无 | 常驻GPU的MOE专家层`0`: 第0层，`0-1`: 第0层到第1层，`0,9`: 第0层和第9层 | 留足KV Cache显存后，分配多层可增加性能，并减少对应的内存占用，包含0层才有加速效果 |
-| `LVLLM_GPU_PREFETCH_WINDOW` | GPU预填充参数 | 无 | 预取窗口大小`1`: 预取1层MOE专家 |  一般预取1到2层即可 |
-| `LVLLM_GPU_PREFILL_MIN_BATCH_SIZE` | GPU预填充参数 | 无 | 使用GPU预填充的最小输入长度`4096`：输入长度达到该值后，启动GPU预填充 | 设置值不宜过小，设置为0则关闭GPU预填充功能 |
-| `LK_POWER_SAVING` | cpu节能 | 0 | `1`：启用cpu节能模式，`0`：禁用cpu节能模式 | 建议值：`0` |
-| `LVLLM_ENABLE_NUMA_INTERLEAVE` | 性能参数 | 0 | `0`：快速加载模型，`1`：慢速加载模型可避免OOM | 建议值：加载模型文件时，内存充裕使用`0`，内存紧张使用`1` |
-| `LVLLM_MOE_QUANT_ON_GPU` | 性能参数 | 0 | `0`：不启用GPU专家量化，`1`：启用GPU专家量化 | 显存充足可启用（仅加载时有效，推理时不会额外占用显存），加快模型加载速度 |
-
- 
-| 参数 | 示例值 | 说明 |
-|-----------|-------|-------------|
-| `model` | `/home/guqiong/Models/Models/MiniMax-M2.7` | 模型目录路径 |
-| `host` | `0.0.0.0` | 服务绑定IP地址 |
-| `port` | `8070` | 服务绑定端口号 |
-| `tensor-parallel-size` | `2` | 张量并行大小，小于等于GPU数量 |
-| `pipeline-parallel-size` | `2` (commented) | 流水线并行大小，小于等于GPU数量 |
-| `max-model-len` | `18000` | 最大上下文长度，小于等于模型最大长度 |
-| `gpu-memory-utilization` | `0.92` | 分配给vLLM的GPU显存分配百分比，小于等于1 |
-| `trust-remote-code` | `true` | 是否信任远程代码，建议值 |
-| `tokenizer-mode` | `auto` | 分词器模式，建议值 |
-| `served-model-name` | `Models/MiniMax-M2.7` | 服务模型名称 |
-| `compilation_config.cudagraph_mode` | `FULL_DECODE_ONLY` | 启用CUDA图模式，建议值 |
-| `enable_prefix_caching` | `true` | 启用前缀缓存，建议值 |
-| `enable-chunked-prefill` | `true` | 启用分块预填充，建议值 |
-| `max_num_batched_tokens` | `18000` | 最大批量填充令牌数，关闭GPU预填充时建议值：1024，开启GPU预填充时建议值：同max-model-len |
-| `dtype` | `bfloat16` | 模型中间计算数据类型，建议值bfloat16或float16 |
-| `max_num_seqs` | `4` | 最大并发请求序列，建议值1到4 |
-| `compilation_config.mode` | `VLLM_COMPILE` | 优化模型，建议值 |
- 
- 
-| 参数 | 说明 |
-|-----------|-------------|
-| `kv_cache_dtype: "fp8"` | KV Cache数据类型，40系、50系GPU可开启 (commented) |
-| `speculative-config` | 推测解码配置，建议值关闭 (commented) |
-| `mm-encoder-tp-mode: "data"` | encoder TP模式 (commented) |
- 
-
-## 安装步骤
-
-### 1. 安装CUDA 13.2
-
-```bash
-# 卸载旧版本CUDA和NVIDIA驱动
-sudo /usr/local/cuda/bin/cuda-uninstaller   
-sudo nvidia-uninstall
-
-# 下载并安装CUDA 13.2
-wget https://developer.download.nvidia.com/compute/cuda/13.2.0/local_installers/cuda_13.2.0_595.45.04_linux.run
-sudo sh cuda_13.2.0_595.45.04_linux.run
-```
-
-### 2. 创建Python环境
-
-```bash
-conda create -n Lvllm python==3.12.11
-conda activate Lvllm
-pip install setuptools_scm
-
-# 升级libstdcxx-ng（避免glibcxx版本问题）
-conda install -c conda-forge libstdcxx-ng
-export LD_LIBRARY_PATH=$CONDA_PREFIX/lib:$LD_LIBRARY_PATH
-
-# 安装NUMA库
-sudo apt-get install libnuma-dev      # Ubuntu
-sudo dnf install numactl-devel        # Rocky Linux
-```
-
-### 3. 安装依赖
-
-```bash
-# 克隆仓库
-git clone https://github.com/guqiong96/Lvllm.git
-cd Lvllm
-
-# 安装PyTorch 2.11.0
-pip install torchaudio triton torchvision pybind11 torch==2.11.0
-
-```
- 
-### 4. 安装Lvllm
-
-```bash 
-MAX_JOBS=32 NVCC_THREADS=1 CMAKE_BUILD_TYPE=Release CMAKE_ARGS="-DCMAKE_BUILD_TYPE=Release" pip install -e . --no-build-isolation -vvv
-```
-
-**参数说明：**
-- `MAX_JOBS=32 NVCC_THREADS=1`: 减少编译内存占用
-- `CMAKE_BUILD_TYPE=Release`: 性能优化选项
-- `CMAKE_ARGS="-DCMAKE_BUILD_TYPE=Release`: 性能优化选项
- 
- 
- 
-## 更新
-
-如果已安装Lvllm，需要更新到最新版本，请执行以下命令：
-
-```bash 
-# 此命令适合普通用户，如果保留本地修改内容的用户应知道提前做处理
-git fetch && git reset --hard origin/main && git clean -fd 
-
-# 安装PyTorch 2.11.0
-pip uninstall torchaudio triton torchvision torch vllm
-pip install torchaudio triton torchvision pybind11 torch==2.11.0
-
-# Qwen3-VL GLM4.6V 需要安装 xformers
-  
-# 编译安装
-rm -rf .deps/*build* 
-rm -rf build 
-MAX_JOBS=32 NVCC_THREADS=1 CMAKE_BUILD_TYPE=Release CMAKE_ARGS="-DCMAKE_BUILD_TYPE=Release" pip install -e . --no-build-isolation -vvv
-
-rm -rf ~/.cache/vllm
-rm -rf ~/.cache/flashinfer
-rm -rf ~/.triton/cache
-
-# 编译打包
-TORCH_CUDA_ARCH_LIST="8.0;8.6" MAX_JOBS=32 NVCC_THREADS=1 CMAKE_BUILD_TYPE=Release CMAKE_ARGS="-DCMAKE_BUILD_TYPE=Release" pip wheel . --no-build-isolation -vvv -w dist/
 ```
  
 ## 优化
