@@ -103,8 +103,8 @@ sudo dnf install numactl-devel        # Rocky Linux
 git clone https://github.com/guqiong96/Lvllm.git
 cd Lvllm
 
-# 安装PyTorch 2.11.0
-pip install torchaudio triton torchvision pybind11 torch==2.11.0
+# 安装PyTorch 2.13.0
+pip install torchaudio triton torchvision pybind11 torch==2.13.0
 
 ```
  
