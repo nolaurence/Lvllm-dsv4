@@ -6,11 +6,12 @@ from typing import NamedTuple
 
 from vllm.logger import init_logger
 from vllm.utils.math_utils import cdiv, round_down
-from vllm.v1.core.block_pool import BlockPool
+from vllm.v1.core.block_pool import BlockPool, BlockPoolCollection
 from vllm.v1.core.kv_cache_metrics import KVCacheMetricsCollector
 from vllm.v1.core.kv_cache_utils import (
     BlockHash,
     KVCacheBlock,
+    dcp_world_size_for_kv_cache_spec,
 )
 from vllm.v1.core.single_type_kv_cache_manager import (
     CrossAttentionManager,
@@ -95,12 +96,21 @@ class KVCacheCoordinator(ABC):
         self.scheduler_block_size = scheduler_block_size
         self.num_reprefillable_tokens = max(0, num_prefill_lookahead - 1)
 
-        self.block_pool = BlockPool(
-            num_gpu_blocks=kv_cache_config.num_blocks,
-            enable_caching=enable_caching,
-            hash_block_size=hash_block_size,
-            enable_kv_cache_events=enable_kv_cache_events,
-            metrics_collector=metrics_collector,
+        self.block_pools = tuple(
+            BlockPool(
+                num_gpu_blocks=kv_cache_config.num_blocks,
+                enable_caching=enable_caching,
+                hash_block_size=hash_block_size,
+                enable_kv_cache_events=enable_kv_cache_events,
+                metrics_collector=metrics_collector,
+                pool_id=pool_id,
+            )
+            for pool_id in range(kv_cache_config.num_pools)
+        )
+        self.block_pool: BlockPool | BlockPoolCollection = (
+            self.block_pools[0]
+            if len(self.block_pools) == 1
+            else BlockPoolCollection(self.block_pools)
         )
 
         # KV cache group indices that get the EAGLE last-block drop.
@@ -138,10 +148,12 @@ class KVCacheCoordinator(ABC):
                 kv_cache_spec=kv_cache_group.kv_cache_spec,
                 max_in_flight_tokens=max_in_flight_tokens,
                 max_model_len=max_model_len,
-                block_pool=self.block_pool,
+                block_pool=self.block_pools[kv_cache_group.pool_id],
                 enable_caching=enable_caching,
                 kv_cache_group_id=i,
-                dcp_world_size=dcp_world_size,
+                dcp_world_size=dcp_world_size_for_kv_cache_spec(
+                    kv_cache_group.kv_cache_spec, dcp_world_size
+                ),
                 pcp_world_size=pcp_world_size,
                 scheduler_block_size=self.scheduler_block_size,
                 needs_kv_cache_zeroing=self.kv_cache_config.needs_kv_cache_zeroing,
@@ -193,12 +205,14 @@ class KVCacheCoordinator(ABC):
         Returns:
             The number of blocks to allocate.
         """
-        num_blocks_to_allocate = 0
+        blocks_per_pool: dict[int, int] = {
+            pool_id: 0 for pool_id in range(len(self.block_pools))
+        }
         for i, manager in enumerate(self.single_type_managers):
             if isinstance(manager, CrossAttentionManager):
                 # For cross-attention, we issue a single static allocation
                 # of blocks based on the number of encoder input tokens.
-                num_blocks_to_allocate += manager.get_num_blocks_to_allocate(
+                num_blocks = manager.get_num_blocks_to_allocate(
                     request_id,
                     num_encoder_tokens,
                     [],
@@ -208,7 +222,7 @@ class KVCacheCoordinator(ABC):
                     apply_admission_cap=apply_admission_cap,
                 )
             else:
-                num_blocks_to_allocate += manager.get_num_blocks_to_allocate(
+                num_blocks = manager.get_num_blocks_to_allocate(
                     request_id,
                     num_tokens,
                     new_computed_blocks[i],
@@ -217,7 +231,9 @@ class KVCacheCoordinator(ABC):
                     num_tokens_main_model,
                     apply_admission_cap=apply_admission_cap,
                 )
-        return num_blocks_to_allocate
+            pool_id = self.kv_cache_config.kv_cache_groups[i].pool_id
+            blocks_per_pool[pool_id] += num_blocks
+        return max(blocks_per_pool.values(), default=0)
 
     def allocate_new_computed_blocks(
         self,
@@ -506,11 +522,9 @@ class UnitaryKVCacheCoordinator(KVCacheCoordinator):
             num_prefill_lookahead=num_prefill_lookahead,
         )
         self.kv_cache_spec = self.kv_cache_config.kv_cache_groups[0].kv_cache_spec
-        self.block_size = self.kv_cache_spec.block_size
-        self.dcp_world_size = dcp_world_size
+        self.dcp_world_size = self.single_type_managers[0].dcp_world_size
         self.pcp_world_size = pcp_world_size
-        if dcp_world_size > 1:
-            self.block_size *= dcp_world_size
+        self.block_size = self.single_type_managers[0].block_size
         # For models using only Mamba, block_size is set to max_model_len when
         # prefix caching is disabled, and hash_block_size validation is skipped.
         assert not enable_caching or (hash_block_size == self.block_size), (
@@ -531,7 +545,7 @@ class UnitaryKVCacheCoordinator(KVCacheCoordinator):
             block_hashes=block_hashes,
             max_length=max_cache_hit_length,
             kv_cache_group_ids=[0],
-            block_pool=self.block_pool,
+            block_pool=self.block_pools[0],
             kv_cache_spec=self.kv_cache_spec,
             drop_eagle_block=0 in self.eagle_group_ids,
             alignment_tokens=self.block_size,
@@ -555,6 +569,7 @@ class SpecGroup(NamedTuple):
     group_ids: list[int]
     manager_cls: type[SingleTypeKVCacheManager]
     use_eagle: bool
+    pool_id: int
 
 
 class HybridKVCacheCoordinator(KVCacheCoordinator):
@@ -645,8 +660,11 @@ class HybridKVCacheCoordinator(KVCacheCoordinator):
         if self.enable_partial_hash_hits:
             unsupported_partial_hit_managers = {
                 type(manager).__name__
-                for manager in self.single_type_managers
-                if not manager.supports_fine_grained_hash_lookup
+                for manager, group in zip(
+                    self.single_type_managers, kv_cache_config.kv_cache_groups
+                )
+                if group.kv_cache_spec.prefix_cacheable
+                and not manager.supports_fine_grained_hash_lookup
                 and manager.block_size != hash_block_size
             }
             if unsupported_partial_hit_managers:
@@ -656,6 +674,9 @@ class HybridKVCacheCoordinator(KVCacheCoordinator):
                     "cache managers require block-aligned lookups: %s.",
                     ", ".join(sorted(unsupported_partial_hit_managers)),
                 )
+        cache_hit_alignment_tokens = self._cache_hit_alignment_tokens
+        for manager in self.single_type_managers:
+            manager.cache_hit_alignment_tokens = cache_hit_alignment_tokens
         self.verify_and_split_kv_cache_groups()
 
     @property
@@ -688,7 +709,7 @@ class HybridKVCacheCoordinator(KVCacheCoordinator):
 
             # Try to find an existing group with the same spec
             for idx, group in enumerate(self.attention_groups):
-                if group.spec == spec:
+                if group.spec == spec and group.pool_id == g.pool_id:
                     assert manager_cls is group.manager_cls, (
                         "Expected same manager class for identical KV cache specs."
                     )
@@ -698,11 +719,11 @@ class HybridKVCacheCoordinator(KVCacheCoordinator):
                     break
             else:
                 self.attention_groups.append(
-                    SpecGroup(spec, [i], manager_cls, use_eagle)
+                    SpecGroup(spec, [i], manager_cls, use_eagle, g.pool_id)
                 )
 
-        assert len(self.attention_groups) > 1, (
-            "HybridKVCacheCoordinator requires at least two attention groups."
+        assert self.attention_groups, (
+            "HybridKVCacheCoordinator requires at least one cacheable group."
         )
 
         # Put full attention first: its efficient left-to-right scan provides
@@ -813,7 +834,7 @@ class HybridKVCacheCoordinator(KVCacheCoordinator):
         while True:
             curr_hit_length = hit_length
 
-            for idx, (spec, group_ids, manager_cls, use_eagle) in enumerate(
+            for idx, (spec, group_ids, manager_cls, use_eagle, pool_id) in enumerate(
                 self.attention_groups
             ):
                 first_group_id = group_ids[0]
@@ -853,15 +874,16 @@ class HybridKVCacheCoordinator(KVCacheCoordinator):
                     block_hashes=block_hashes,
                     max_length=_max_length,
                     kv_cache_group_ids=group_ids,
-                    block_pool=self.block_pool,
+                    block_pool=self.block_pools[pool_id],
                     kv_cache_spec=spec,
                     drop_eagle_block=drop_eagle_block,
                     alignment_tokens=self._cache_hit_alignment_tokens,
-                    dcp_world_size=(
-                        self.dcp_world_size
-                        if isinstance(spec, FullAttentionSpec)
-                        else 1
-                    ),
+                    dcp_world_size=self.single_type_managers[
+                        first_group_id
+                    ].dcp_world_size,
+                    pcp_world_size=self.single_type_managers[
+                        first_group_id
+                    ].pcp_world_size,
                 )
                 if drop_eagle_block:
                     eagle_verified.add(idx)
@@ -881,14 +903,14 @@ class HybridKVCacheCoordinator(KVCacheCoordinator):
             if is_simple_hybrid:
                 break
 
-        # Truncate full attention blocks to final hit_length (if present)
-        first_group = self.attention_groups[0]
-        if isinstance(first_group.spec, FullAttentionSpec):
-            group_block_size = self.single_type_managers[
-                first_group.group_ids[0]
-            ].block_size
+        # Truncate every full-attention group (target and draft) blocks
+        # to final hit_length.
+        for group in self.attention_groups:
+            if not isinstance(group.spec, FullAttentionSpec):
+                continue
+            group_block_size = self.single_type_managers[group.group_ids[0]].block_size
             num_blocks = cdiv(hit_length, group_block_size)
-            for group_id in first_group.group_ids:
+            for group_id in group.group_ids:
                 if (blks := hit_blocks_by_group[group_id]) is not None:
                     del blks[num_blocks:]
                     hit_length_by_group[group_id] = hit_length
@@ -917,15 +939,17 @@ class HybridKVCacheCoordinator(KVCacheCoordinator):
         hit_blocks: list[list[KVCacheBlock]] = [[] for _ in range(num_groups)]
         hit_lengths: list[int] = [0] * num_groups
 
-        for spec, group_ids, manager_cls, use_eagle in self.attention_groups:
+        for spec, group_ids, manager_cls, use_eagle, pool_id in self.attention_groups:
             blocks, group_hit = manager_cls.find_longest_cache_hit(
                 block_hashes=block_hashes,
                 max_length=max_cache_hit_length,
                 kv_cache_group_ids=group_ids,
-                block_pool=self.block_pool,
+                block_pool=self.block_pools[pool_id],
                 kv_cache_spec=spec,
                 drop_eagle_block=use_eagle,
                 alignment_tokens=self._cache_hit_alignment_tokens,
+                dcp_world_size=manager.dcp_world_size,
+                pcp_world_size=manager.pcp_world_size,
             )
             for gid, blks in zip(group_ids, blocks):
                 hit_blocks[gid] = blks

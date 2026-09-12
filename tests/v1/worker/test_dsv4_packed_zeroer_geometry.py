@@ -98,6 +98,37 @@ def test_packed_dsv4_zeroer_zeroes_only_each_layers_page():
     assert last_end <= base + raw.numel()
 
 
+def test_zeroer_builds_disjoint_metadata_for_logical_pools():
+    spec = MLAAttentionSpec(
+        block_size=16,
+        num_kv_heads=1,
+        head_size=16,
+        dtype=torch.int32,
+    )
+    target = torch.zeros((4, 1, 16, 16), dtype=torch.int32)
+    draft = torch.zeros_like(target)
+    zeroer = KVBlockZeroer(
+        torch.device("cpu"),
+        attn_groups_iter=iter(
+            [
+                AttentionGroup(None, ["target"], spec, 0),
+                AttentionGroup(None, ["draft"], spec, 1),
+            ]
+        ),
+        kernel_block_sizes=[16, 16],
+        static_forward_context={
+            "target": SimpleNamespace(kv_cache=target),
+            "draft": SimpleNamespace(kv_cache=draft),
+        },
+        num_blocks=4,
+        kv_cache_group_pool_ids=[0, 1],
+    )
+
+    assert set(zeroer._meta_by_pool) == {0, 1}
+    assert zeroer._meta_by_pool[0][0].tolist() == [target.data_ptr()]
+    assert zeroer._meta_by_pool[1][0].tolist() == [draft.data_ptr()]
+
+
 def test_overlaid_zeroer_dedups_segments_with_max_span():
     """Two groups overlay one allocation; the zeroer must emit one segment per distinct
     byte offset, spanning the widest overlaid page, so a newly allocated block is fully

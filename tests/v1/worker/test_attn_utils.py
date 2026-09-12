@@ -218,6 +218,25 @@ def test_copy_kv_cache_blocks_shared_storage(layout: KVCacheLayout):
         torch.testing.assert_close(cache[1], expected[layer_idx][1])
 
 
+def test_copy_kv_cache_blocks_only_updates_selected_pool():
+    num_blocks = 4
+    target = torch.arange(16, dtype=torch.float32).view(num_blocks, 4)
+    draft = torch.arange(16, 32, dtype=torch.float32).view(num_blocks, 4)
+    expected_target = target.clone()
+    expected_draft = draft.clone()
+
+    copy_kv_cache_blocks_inplace(
+        [target, draft],
+        num_blocks,
+        [KVCacheBlockCopy(src_block_id=0, dst_block_id=2, pool_id=1)],
+        kv_cache_pool_ids=[0, 1],
+    )
+
+    torch.testing.assert_close(target, expected_target)
+    torch.testing.assert_close(draft[2], expected_draft[0])
+    torch.testing.assert_close(draft[1], expected_draft[1])
+
+
 def test_fixed_block_stride_propagates_outward_in_lhbnc():
     num_blocks = 3
     num_layers = 2
