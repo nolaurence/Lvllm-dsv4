@@ -277,6 +277,7 @@ if TYPE_CHECKING:
     VLLM_KV_EVENTS_USE_INT_BLOCK_HASHES: bool = True
     VLLM_OBJECT_STORAGE_SHM_BUFFER_NAME: str = "VLLM_OBJECT_STORAGE_SHM_BUFFER"
     LVLLM_MOE_NUMA_ENABLED: bool = False
+    VLLM_SM86_DEEPSEEK_V4_REF: bool = False
     LVLLM_GLM5_ATTN_W4A16: bool = False
     LVLLM_GLM5_ATTN_W8A16: bool = False
     LVLLM_GLM5_SHARED_EXPERT_CPU: bool = False
@@ -2005,6 +2006,9 @@ environment_variables: dict[str, Callable[[], Any]] = {
     # Whether to enable NUMA for MOE.
     "LVLLM_MOE_NUMA_ENABLED": lambda: bool(
         int(os.getenv("LVLLM_MOE_NUMA_ENABLED", "0"))
+    ),
+    "VLLM_SM86_DEEPSEEK_V4_REF": lambda: bool(
+        int(os.getenv("VLLM_SM86_DEEPSEEK_V4_REF", "0"))
     ),
     # Fail-closed compatibility flag for the disabled GLM-5 attention W4 path.
     "LVLLM_GLM5_ATTN_W4A16": lambda: bool(int(os.getenv("LVLLM_GLM5_ATTN_W4A16", "0"))),

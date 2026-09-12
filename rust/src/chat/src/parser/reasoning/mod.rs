@@ -84,6 +84,7 @@ impl ReasoningParserFactory {
 
         factory
             .register_pattern("deepseek-r1", names::DEEPSEEK_R1)
+            .register_pattern("deepseek-v4.1", names::DEEPSEEK_V41)
             .register_pattern("deepseek-v4", names::DEEPSEEK_V4)
             .register_pattern("deepseek_v4", names::DEEPSEEK_V4)
             .register_pattern("deepseek-v3", names::DEEPSEEK_V3)

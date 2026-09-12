@@ -1,6 +1,7 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 
+from dataclasses import dataclass
 from fnmatch import fnmatch
 from typing import TYPE_CHECKING, Any, cast
 
@@ -96,6 +97,14 @@ if TYPE_CHECKING:
     from vllm.model_executor.models.utils import WeightsMapper
 
 logger = init_logger(__name__)
+
+
+@dataclass(frozen=True)
+class CkptCtx:
+    """Checkpoint layout metadata used by DeepSeek V4.1 quantization."""
+
+    group_size: int | None = None
+    scale_block_size: tuple[int, int] | None = None
 
 QUANT_ALGOS = [
     # FP8 (per-tensor weight + optional static activation scale).
@@ -2466,3 +2475,16 @@ class ModelOptMixedPrecisionConfig(ModelOptQuantConfigBase):
         super().apply_vllm_mapper(hf_to_vllm_mapper)
         if self.quantized_layers:
             self.quantized_layers = hf_to_vllm_mapper.apply_dict(self.quantized_layers)
+
+
+class ModelOptLinearMethod(ModelOptMxFp8LinearMethod):
+    """Compatibility adapter for V4.1's block-MXFP8 attention weights.
+
+    V4.1 supplies the newer ``(QuantSpec, CkptCtx)`` interface while this
+    branch's ModelOpt implementation uses ``ModelOptMxFp8Config`` directly.
+    The serialized MXFP8 kernel path is otherwise identical.
+    """
+
+    def __init__(self, quant_spec, ckpt_ctx: CkptCtx) -> None:
+        del quant_spec, ckpt_ctx
+        super().__init__(ModelOptMxFp8Config(True, None, []))

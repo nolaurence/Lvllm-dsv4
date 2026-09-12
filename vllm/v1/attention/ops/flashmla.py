@@ -67,6 +67,10 @@ def is_flashmla_sparse_supported() -> tuple[bool, str | None]:
     """
     Return: is_supported_flag, unsupported_reason (optional).
     """
+    # The SM86 DeepSeek V4/V4.1 path is a PyTorch/Triton reference fallback
+    # and deliberately does not require the Hopper FlashMLA extension.
+    if _use_sm86_flashmla_reference():
+        return True, None
     is_available, maybe_reason = _is_flashmla_available()
     if not is_available:
         return False, maybe_reason
@@ -101,7 +105,7 @@ def _use_sm86_flashmla_reference() -> bool:
         return False
 
 
-if _is_flashmla_available()[0]:
+if _is_flashmla_available()[0] and not _use_sm86_flashmla_reference():
     from vllm.third_party.flashmla.flash_mla_interface import (  # noqa: F401
         FlashMLASchedMeta,
         flash_attn_varlen_func,

@@ -229,6 +229,7 @@ def fused_inv_rope_fp8_quant(
     rope_dim: int = 64,
     quant_group_size: int = 128,
     tma_aligned_scales: bool = False,
+    quantize: bool = True,
 ) -> tuple[torch.Tensor, torch.Tensor]:
     """Fused inverse RoPE + block-scaled FP8 quantization.
 
@@ -272,7 +273,6 @@ def fused_inv_rope_fp8_quant(
     assert num_heads == n_groups * heads_per_group
     assert head_dim == nope_dim + rope_dim
     assert head_dim % quant_group_size == 0
-    assert nope_dim % quant_group_size == (quant_group_size - rope_dim)
     assert rope_dim % 2 == 0
     assert cos_sin_cache.shape[-1] == rope_dim
     assert cos_sin_cache.dtype == torch.float32
@@ -307,8 +307,11 @@ def fused_inv_rope_fp8_quant(
         n_groups,
         d,
         scale_inner,
+        quantize,
     )
-    return fp8_buf.transpose(0, 1), scale_buf.transpose(0, 1)
+    output = out_buf.transpose(0, 1)
+    scales = scale_buf.transpose(0, 1) if quantize else scale_buf
+    return output, scales
 
 
 def _fused_inv_rope_fp8_quant_kernel_impl(
@@ -318,7 +321,7 @@ def _fused_inv_rope_fp8_quant_kernel_impl(
     heads_per_group: int,
     quant_group_size: int,
     chunks_per_head: int,
-    rope_start: int,
+    nope_dim: int,
     half_rope: int,
     tma_aligned_scales: bool,
     fp8_max: float,
@@ -382,7 +385,7 @@ def _fused_inv_rope_fp8_quant_kernel_fake(
     heads_per_group: int,
     quant_group_size: int,
     chunks_per_head: int,
-    rope_start: int,
+    nope_dim: int,
     half_rope: int,
     tma_aligned_scales: bool,
     fp8_max: float,
@@ -391,13 +394,16 @@ def _fused_inv_rope_fp8_quant_kernel_fake(
     n_groups: int,
     d: int,
     scale_inner: int,
+    quantize: bool,
 ) -> tuple[torch.Tensor, torch.Tensor]:
-    fp8_buf = torch.empty(
+    scale_dtype = torch.int32 if tma_aligned_scales else torch.float32
+    out_buf = torch.empty(
         (n_groups, num_tokens, d),
-        dtype=torch.float8_e4m3fn,
+        dtype=torch.float8_e4m3fn if quantize else o.dtype,
         device=o.device,
     )
-    scale_dtype = torch.int32 if tma_aligned_scales else torch.float32
+    if not quantize:
+        return out_buf, torch.empty(0, dtype=scale_dtype, device=o.device)
     scale_buf = torch.empty(
         n_groups * scale_inner * tma_aligned_T,
         dtype=scale_dtype,
@@ -406,7 +412,7 @@ def _fused_inv_rope_fp8_quant_kernel_fake(
         (n_groups, num_tokens, scale_inner),
         (scale_inner * tma_aligned_T, 1, tma_aligned_T),
     )
-    return fp8_buf, scale_buf
+    return out_buf, scale_buf
 
 
 direct_register_custom_op(

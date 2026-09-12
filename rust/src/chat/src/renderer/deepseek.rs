@@ -1,11 +1,12 @@
 // SPDX-License-Identifier: Apache-2.0
 // SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 
-//! DeepSeek V4 prompt renderer.
+//! Shared DeepSeek V4 and V4.1 prompt rendering.
 //!
 //! Official Python reference:
 //! <https://huggingface.co/deepseek-ai/DeepSeek-V4-Flash/blob/main/encoding/encoding_dsv4.py>
 
+use std::borrow::Cow;
 use std::collections::HashMap;
 use std::fmt::Write as _;
 
@@ -13,8 +14,12 @@ use serde::Serialize;
 use serde_json::Value;
 use serde_json_fmt::JsonFormat;
 
+use llm_multimodal::DEEPSEEK_V41_IMAGE_PLACEHOLDER;
+
 use crate::error::{Error, Result};
-use crate::request::{ChatContent, ChatMessage, ChatRequest, ChatTool, ReasoningEffort};
+use crate::request::{
+    ChatContent, ChatContentPart, ChatMessage, ChatRequest, ChatTool, ReasoningEffort,
+};
 use crate::{AssistantContentBlock, AssistantMessageExt, AssistantToolCall};
 
 const BOS_TOKEN: &str = "<｜begin▁of▁sentence｜>";
@@ -23,6 +28,7 @@ const THINKING_START_TOKEN: &str = "<think>";
 const THINKING_END_TOKEN: &str = "</think>";
 const DSML_TOKEN: &str = "｜DSML｜";
 const USER_SP_TOKEN: &str = "<｜User｜>";
+const SYSTEM_SP_TOKEN: &str = "<｜System｜>";
 const ASSISTANT_SP_TOKEN: &str = "<｜Assistant｜>";
 const REASONING_EFFORT_HIGH: &str = concat!(
     "Reasoning Effort: Absolute maximum with no shortcuts permitted.\n",
@@ -39,6 +45,35 @@ const REASONING_EFFORT_MAX: &str = concat!(
 enum ThinkingMode {
     Chat,
     Thinking,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(super) enum DsDialect {
+    V4,
+    V41,
+}
+
+impl DsDialect {
+    fn tool_calls_tag(self) -> &'static str {
+        match self {
+            Self::V4 => "tool_calls",
+            Self::V41 => " calls",
+        }
+    }
+
+    fn invoke_tag(self) -> &'static str {
+        match self {
+            Self::V4 => "invoke",
+            Self::V41 => " invoke",
+        }
+    }
+
+    fn parameter_tag(self) -> &'static str {
+        match self {
+            Self::V4 => "parameter",
+            Self::V41 => " parameter",
+        }
+    }
 }
 
 #[serde_with::skip_serializing_none]
@@ -153,6 +188,57 @@ fn resolve_thinking_options(request: &ChatRequest) -> Result<(ThinkingMode, &'st
     Ok((thinking_mode, reasoning_effort_prompt))
 }
 
+/// Resolve V4.1's numeric reasoning effort using the top-level value before template kwargs.
+fn resolve_v41_thinking_options(
+    request: &ChatRequest,
+) -> Result<(ThinkingMode, Cow<'static, str>)> {
+    let mut thinking = request.enable_thinking()?.unwrap_or(true);
+    let budget = match request.chat_options.reasoning_effort {
+        Some(ReasoningEffort::None) => {
+            thinking = false;
+            50
+        }
+        Some(ReasoningEffort::Low) => 25,
+        Some(ReasoningEffort::High) => 50,
+        Some(ReasoningEffort::XHigh) => 75,
+        Some(ReasoningEffort::Max) => 100,
+        Some(ReasoningEffort::Minimal | ReasoningEffort::Medium) => {
+            return Err(invalid_v41_reasoning_effort());
+        }
+        None => match request.chat_options.template_kwargs.get("reasoning_effort") {
+            None | Some(Value::Null) => 50,
+            Some(Value::String(effort)) => match effort.as_str() {
+                "low" => 25,
+                "high" => 50,
+                "xhigh" => 75,
+                "max" => 100,
+                _ => return Err(invalid_v41_reasoning_effort()),
+            },
+            Some(Value::Number(budget)) => budget
+                .as_u64()
+                .filter(|budget| (1..=100).contains(budget))
+                .ok_or_else(invalid_v41_reasoning_effort)?,
+            Some(_) => return Err(invalid_v41_reasoning_effort()),
+        },
+    };
+    if thinking {
+        Ok((
+            ThinkingMode::Thinking,
+            Cow::Owned(format!(
+                "Reasoning Effort: {budget} (range 1-100, the higher the value, the more thorough the reasoning)\n\n"
+            )),
+        ))
+    } else {
+        Ok((ThinkingMode::Chat, Cow::Borrowed("")))
+    }
+}
+
+fn invalid_v41_reasoning_effort() -> Error {
+    Error::InvalidReasoningEffort(
+        "DeepSeek V4.1 reasoning_effort must be low, high, xhigh, max, or an integer within [1, 100] in chat_template_kwargs".to_string(),
+    )
+}
+
 /// Return request-level tools only when native tool parsing is enabled.
 fn request_tools(request: &ChatRequest) -> &[ChatTool] {
     if request.tool_parsing_enabled() {
@@ -240,22 +326,26 @@ fn next_rendered_entry_is_assistant_or_end(messages: &[ChatMessage], message_ind
         .unwrap_or(true)
 }
 
-/// Render the tool preamble shown to the model, V4 flavor.
-fn render_tools(out: &mut String, tools: &[ChatTool]) -> Result<()> {
-    out.push_str(
+/// Render the tool preamble shown to the model for one DeepSeek dialect.
+fn render_tools(out: &mut String, tools: &[ChatTool], dialect: DsDialect) -> Result<()> {
+    let tool_calls_tag = dialect.tool_calls_tag();
+    let invoke_tag = dialect.invoke_tag();
+    let parameter_tag = dialect.parameter_tag();
+    write!(
+        out,
         r#"## Tools
 
-You have access to a set of tools to help answer the user's question. You can invoke tools by writing a "<｜DSML｜tool_calls>" block like the following:
+You have access to a set of tools to help answer the user's question. You can invoke tools by writing a "<｜DSML｜{tool_calls_tag}>" block like the following:
 
-<｜DSML｜tool_calls>
-<｜DSML｜invoke name="$TOOL_NAME">
-<｜DSML｜parameter name="$PARAMETER_NAME" string="true|false">$PARAMETER_VALUE</｜DSML｜parameter>
+<｜DSML｜{tool_calls_tag}>
+<｜DSML｜{invoke_tag} name="$TOOL_NAME">
+<｜DSML｜{parameter_tag} name="$PARAMETER_NAME" string="true|false">$PARAMETER_VALUE</｜DSML｜{parameter_tag}>
 ...
-</｜DSML｜invoke>
-<｜DSML｜invoke name="$TOOL_NAME2">
+</｜DSML｜{invoke_tag}>
+<｜DSML｜{invoke_tag} name="$TOOL_NAME2">
 ...
-</｜DSML｜invoke>
-</｜DSML｜tool_calls>
+</｜DSML｜{invoke_tag}>
+</｜DSML｜{tool_calls_tag}>
 
 String parameters should be specified as is and set `string="true"`. For all other types (numbers, booleans, arrays, objects), pass the value in JSON format and set `string="false"`.
 
@@ -266,7 +356,8 @@ Otherwise, output directly after </think> with tool calls or final response.
 ### Available Tool Schemas
 
 "#,
-    );
+    )
+    .expect("writing to String cannot fail");
 
     for (index, tool) in tools.iter().enumerate() {
         if index > 0 {
@@ -297,13 +388,14 @@ fn render_system_message(
     out: &mut String,
     content: Option<&ChatContent>,
     tools: &[ChatTool],
+    dialect: DsDialect,
 ) -> Result<()> {
     if let Some(content) = content {
-        write_chat_content(out, content)?;
+        write_chat_content(out, content, dialect)?;
     }
     if !tools.is_empty() {
         out.push_str("\n\n");
-        render_tools(out, tools)?;
+        render_tools(out, tools, dialect)?;
     }
     Ok(())
 }
@@ -313,18 +405,19 @@ fn render_developer_message(
     out: &mut String,
     content: &ChatContent,
     tools: &[ChatTool],
+    dialect: DsDialect,
 ) -> Result<()> {
     if content.is_empty() {
         return Err(Error::ChatTemplate(
-            "invalid DeepSeek V4 developer message: empty content".to_string(),
+            "invalid DeepSeek developer message: empty content".to_string(),
         ));
     }
 
     out.push_str(USER_SP_TOKEN);
-    write_chat_content(out, content)?;
+    write_chat_content(out, content, dialect)?;
     if !tools.is_empty() {
         out.push_str("\n\n");
-        render_tools(out, tools)?;
+        render_tools(out, tools, dialect)?;
     }
     Ok(())
 }
@@ -416,9 +509,9 @@ fn last_tool_call_order_before(
 }
 
 /// Render one tool response payload inside a V4 `<tool_result>` block.
-fn write_tool_result(out: &mut String, content: &ChatContent) -> Result<()> {
+fn write_tool_result(out: &mut String, content: &ChatContent, dialect: DsDialect) -> Result<()> {
     out.push_str("<tool_result>");
-    write_chat_content(out, content)?;
+    write_chat_content(out, content, dialect)?;
     out.push_str("</tool_result>");
     Ok(())
 }
@@ -445,6 +538,7 @@ fn render_assistant_message(
     emit_thinking_block: bool,
     append_eos: bool,
     content: &[AssistantContentBlock],
+    dialect: DsDialect,
 ) -> Result<()> {
     let has_tool_calls = content.has_tool_calls();
 
@@ -458,14 +552,15 @@ fn render_assistant_message(
     write_assistant_text(out, content);
 
     if has_tool_calls {
-        out.push_str("\n\n<｜DSML｜tool_calls>\n");
+        let tool_calls_tag = dialect.tool_calls_tag();
+        writeln!(out, "\n\n<{DSML_TOKEN}{tool_calls_tag}>").expect("writing to String cannot fail");
         for (index, tool_call) in content.tool_calls().enumerate() {
             if index > 0 {
                 out.push('\n');
             }
-            render_tool_call(out, tool_call)?;
+            render_tool_call(out, tool_call, dialect)?;
         }
-        out.push_str("\n</｜DSML｜tool_calls>");
+        write!(out, "\n</{DSML_TOKEN}{tool_calls_tag}>").expect("writing to String cannot fail");
     }
 
     if append_eos {
@@ -475,11 +570,20 @@ fn render_assistant_message(
 }
 
 /// Render one assistant tool call in DSML XML-like format.
-fn render_tool_call(out: &mut String, tool_call: &AssistantToolCall) -> Result<()> {
-    writeln!(out, "<{DSML_TOKEN}invoke name=\"{}\">", tool_call.name)
-        .expect("writing to String cannot fail");
-    encode_arguments_to_dsml(out, tool_call)?;
-    write!(out, "\n</{DSML_TOKEN}invoke>").expect("writing to String cannot fail");
+fn render_tool_call(
+    out: &mut String,
+    tool_call: &AssistantToolCall,
+    dialect: DsDialect,
+) -> Result<()> {
+    let invoke_tag = dialect.invoke_tag();
+    writeln!(
+        out,
+        "<{DSML_TOKEN}{invoke_tag} name=\"{}\">",
+        tool_call.name
+    )
+    .expect("writing to String cannot fail");
+    encode_arguments_to_dsml(out, tool_call, dialect)?;
+    write!(out, "\n</{DSML_TOKEN}{invoke_tag}>").expect("writing to String cannot fail");
     Ok(())
 }
 
@@ -487,15 +591,20 @@ fn render_tool_call(out: &mut String, tool_call: &AssistantToolCall) -> Result<(
 ///
 /// String values are emitted raw with `string="true"`, while all other JSON
 /// values are rendered with JSON syntax and `string="false"`.
-fn encode_arguments_to_dsml(out: &mut String, tool_call: &AssistantToolCall) -> Result<()> {
+fn encode_arguments_to_dsml(
+    out: &mut String,
+    tool_call: &AssistantToolCall,
+    dialect: DsDialect,
+) -> Result<()> {
+    let parameter_tag = dialect.parameter_tag();
     let arguments: Value = serde_json::from_str(&tool_call.arguments).map_err(|error| {
         Error::ChatTemplate(format!(
-            "assistant tool call has invalid JSON arguments for DeepSeek V4: {error}"
+            "assistant tool call has invalid JSON arguments for DeepSeek: {error}"
         ))
     })?;
     let Some(arguments) = arguments.as_object() else {
         return Err(Error::ChatTemplate(
-            "assistant tool call arguments for DeepSeek V4 must be a JSON object".to_string(),
+            "assistant tool call arguments for DeepSeek must be a JSON object".to_string(),
         ));
     };
 
@@ -508,7 +617,7 @@ fn encode_arguments_to_dsml(out: &mut String, tool_call: &AssistantToolCall) -> 
         let is_string = matches!(value, Value::String(_));
         write!(
             out,
-            "<{DSML_TOKEN}parameter name=\"{key}\" string=\"{}\">",
+            "<{DSML_TOKEN}{parameter_tag} name=\"{key}\" string=\"{}\">",
             if is_string { "true" } else { "false" }
         )
         .expect("writing to String cannot fail");
@@ -518,7 +627,7 @@ fn encode_arguments_to_dsml(out: &mut String, tool_call: &AssistantToolCall) -> 
             value => out.push_str(&json_dumps(value)?),
         }
 
-        write!(out, "</{DSML_TOKEN}parameter>").expect("writing to String cannot fail");
+        write!(out, "</{DSML_TOKEN}{parameter_tag}>").expect("writing to String cannot fail");
         wrote_parameter = true;
     }
 
@@ -527,12 +636,24 @@ fn encode_arguments_to_dsml(out: &mut String, tool_call: &AssistantToolCall) -> 
 
 /// Write chat content directly into the destination buffer without flattening
 /// it into an intermediate `String`.
-fn write_chat_content(out: &mut String, content: &ChatContent) -> Result<()> {
+///
+/// The V4.1 dialect inlines the image placeholder at each image part's
+/// position unconditionally (matching the Python encoding's
+/// `IMAGE_PLACEHOLDER`); other dialects reject multimodal parts.
+fn write_chat_content(out: &mut String, content: &ChatContent, dialect: DsDialect) -> Result<()> {
     match content {
         ChatContent::Text(text) => out.push_str(text),
         ChatContent::Parts(parts) => {
-            for part in parts {
-                out.push_str(part.as_text()?);
+            for (index, part) in parts.iter().enumerate() {
+                if index > 0 && dialect == DsDialect::V41 {
+                    out.push_str("\n\n");
+                }
+                match part {
+                    ChatContentPart::ImageUrl { .. } if dialect == DsDialect::V41 => {
+                        out.push_str(DEEPSEEK_V41_IMAGE_PLACEHOLDER);
+                    }
+                    _ => out.push_str(part.as_text()?),
+                }
             }
         }
     }
@@ -568,7 +689,7 @@ fn json_dumps<T: Serialize>(value: &T) -> Result<String> {
         .format_to_string(value)
         .map_err(|error| {
             Error::ChatTemplate(format!(
-                "failed to serialize DeepSeek V4 JSON payload: {error}"
+                "failed to serialize DeepSeek JSON payload: {error}"
             ))
         })
 }

@@ -1020,12 +1020,10 @@ def test_inflight_finish_deferred_cleanup() -> None:
 # Test 8: Null GPU blocks are skipped in store and load transfer pairs
 # ---------------------------------------------------------------------------
 def test_multi_group_null_blocks_skipped() -> None:
-    """Null GPU blocks (no block_hash) must not appear in store or load pairs.
+    """The null block id never appears in store or load pairs.
 
-    In eager store mode, _prepare_eager_store_specs skips blocks whose
-    block_hash is None (null blocks have no hash). We verify this by mixing
-    real hashed blocks with unhashed (null-like) blocks in a single group and
-    checking that only real blocks appear in the store list.
+    A null block-table slot whose hash is still cached on the GPU is stored
+    from the cached block instead; the null block itself is never copied.
     """
     fix = make_scheduler(num_cpu_blocks=8, num_gpu_blocks=16, num_groups=1, lazy=False)
     sched = fix.scheduler
@@ -1057,9 +1055,11 @@ def test_multi_group_null_blocks_skipped() -> None:
         f"Null block id {null_block_id} should not appear in store transfer pairs"
     )
 
-    # Only real block should be scheduled for store
-    assert len(meta.store_gpu_blocks) == 1
+    # The nulled slot's hash is still cached on the GPU, so that block is
+    # recovered from the pool and stored alongside the real one.
+    assert len(meta.store_gpu_blocks) == 2
     assert gpu_blocks[0].block_id in meta.store_gpu_blocks
+    assert gpu_blocks[1].block_id in meta.store_gpu_blocks
 
     # Complete the store
     assert meta.store_event >= 0
@@ -1075,13 +1075,12 @@ def test_multi_group_null_blocks_skipped() -> None:
         block_hasher=req._block_hasher,
     )
     hit_tokens, is_async = sched.get_num_new_matched_tokens(req2, num_computed_tokens=0)
-    # Only 1 block was stored (the real one)
-    assert hit_tokens == BLOCK_SIZE
+    assert hit_tokens == 2 * BLOCK_SIZE
     assert is_async is True
 
     # Allocate new GPU blocks for the load
-    gpu_blocks2 = gpu_pool.get_new_blocks(1)
-    kv_blocks2 = KVCacheBlocks(blocks=([gpu_blocks2[0], null_block],))
+    gpu_blocks2 = gpu_pool.get_new_blocks(2)
+    kv_blocks2 = KVCacheBlocks(blocks=(gpu_blocks2,))
     sched.update_state_after_alloc(req2, kv_blocks2, num_external_tokens=hit_tokens)
 
     sched_out2 = make_scheduler_output({req2.request_id: 1})
